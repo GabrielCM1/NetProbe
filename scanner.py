@@ -55,6 +55,14 @@ class Host:
     este_pc: bool = False       # True se for o proprio computador que esta varrendo
     portas: List[int] = field(default_factory=list)
     ttl: Optional[int] = None   # TTL da resposta do ping (da uma pista do sistema operacional)
+    nome: Optional[str] = None
+    modelo: Optional[str] = None
+    servicos: Set[str] = field(default_factory=set)
+    portas_extras: List[int] = field(default_factory=list)
+
+    @property
+    def fabricante(self) -> Optional[str]:
+        return fabricante(self.mac)
 
 
 # --------------------------------------------------------------------------
