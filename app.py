@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, messagebox, ttk
 
 import scanner
+from monitor_local import abrir_monitor
 
 # Fontes comuns em cada sistema (se faltar alguma, o Tk usa a padrao)
 FONTE = ("Segoe UI", 10) if scanner.WINDOWS else ("DejaVu Sans", 10)
@@ -103,6 +104,7 @@ class NetProbeApp:
         self.bt_parar = ttk.Button(botoes, text="Parar", command=self.parar, state="disabled")
         self.bt_parar.pack(fill="x", pady=2)
         ttk.Button(botoes, text="Limpar tabela", command=self.limpar).pack(fill="x", pady=2)
+        ttk.Button(botoes, text="Monitor local", command=lambda: abrir_monitor(self.janela)).pack(fill="x", pady=2)
         ttk.Button(botoes, text="Exportar CSV", command=self.exportar).pack(fill="x", pady=2)
 
         # --- progresso e resumo
