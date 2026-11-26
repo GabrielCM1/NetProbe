@@ -2,7 +2,7 @@
 
 **Monitoramento de rede doméstica por Ping Scan, sondagem ARP e detecção de colisão de IP.**
 
-O NetProbe descobre quais dispositivos estão conectados na rede local, **inclusive os que bloqueiam ping**. Para cada um, ele mostra o MAC, as portas TCP abertas e se o aparelho está online ou offline, atualizando tudo em tempo real. Também avisa quando dois aparelhos disputam o mesmo IP.
+O NetProbe descobre quais dispositivos estão conectados na rede local, **inclusive os que bloqueiam ping**. Para cada um, ele mostra o MAC, as portas TCP abertas e se o aparelho está online ou offline, atualizando tudo em tempo real. Também **identifica que aparelho é** (fabricante, nome e tipo provável) e avisa quando dois aparelhos disputam o mesmo IP.
 
 Trabalho final da disciplina de **Redes de Computadores**, Projeto 2.
 
@@ -13,6 +13,7 @@ Trabalho final da disciplina de **Redes de Computadores**, Projeto 2.
 | Vinculação IP/MAC | Tabela IP ↔ MAC, com alerta de colisão de IP | `verificar_ip()`, `mac_da_tabela_arp()`, `_mac_mudou()` |
 | Interface do usuário | Tabela colorida que se atualiza durante a varredura, com modo monitorar | `app.py` |
 | Portas abertas | *TCP connect scan* no intervalo de portas escolhido | `escanear_portas()` |
+| *Extra:* identificação | Fabricante pelo MAC, nome por mDNS/NetBIOS/DNS e palpite do tipo de aparelho | `fabricante()`, `descobrir_nome()`, `palpite_tipo()` |
 
 ---
 
@@ -22,12 +23,13 @@ Trabalho final da disciplina de **Redes de Computadores**, Projeto 2.
 2. [Como usar](#2-como-usar)
 3. [Como funciona](#3-como-funciona)
 4. [Colisão de IP](#4-colisão-de-ip)
-5. [Desempenho](#5-desempenho)
-6. [Testes automatizados](#6-testes-automatizados)
-7. [Estrutura do código](#7-estrutura-do-código)
-8. [Roteiro para a apresentação](#8-roteiro-para-a-apresentação)
-9. [Limitações conhecidas](#9-limitações-conhecidas)
-10. [Uso responsável](#10-uso-responsável)
+5. [Identificação dos aparelhos](#5-identificação-dos-aparelhos)
+6. [Desempenho](#6-desempenho)
+7. [Testes automatizados](#7-testes-automatizados)
+8. [Estrutura do código](#8-estrutura-do-código)
+9. [Roteiro para a apresentação](#9-roteiro-para-a-apresentação)
+10. [Limitações conhecidas](#10-limitações-conhecidas)
+11. [Uso responsável](#11-uso-responsável)
 
 ---
 
@@ -88,13 +90,16 @@ python app.py
 | Coluna | Conteúdo |
 |---|---|
 | IP | Endereço IPv4 do aparelho |
+| Nome | Nome que o aparelho anuncia na rede, ex.: `Android`, `iPhone-de-Ana`, `DESKTOP-AB12CD` |
+| Tipo provável | Palpite de que aparelho é, ex.: `Roteador`, `Celular/tablet Android`, `Impressora` |
+| Fabricante | Quem fabricou a placa de rede, pelo MAC, ex.: `Samsung Electronics`, `Amazon` |
 | MAC | Endereço físico, no formato `AA-BB-CC-DD-EE-FF` |
 | Status | Online ou Offline |
 | Descoberto por | `Ping (ICMP)`, `ARP (bloqueia ping)` ou `Este computador` |
 | Resposta | Tempo de resposta do ping |
 | Portas abertas | Portas TCP abertas no intervalo, com o nome do serviço, ex.: `80 (HTTP)` |
 | Visto por último | Horário em que o aparelho respondeu pela última vez |
-| Observações | Avisos: colisão de IP, MAC repetido, MAC aleatório |
+| Observações | Avisos: colisão de IP, MAC repetido em vários IPs |
 
 **Cores**
 
@@ -105,7 +110,7 @@ python app.py
 | 🟥 Vermelho | Offline: estava na rede e sumiu |
 | 🟧 Laranja | **Colisão de IP**: o MAC deste IP mudou |
 
-Embaixo da tabela, o **Registro** mostra cada evento com horário: aparelho novo, aparelho que saiu, portas encontradas e alertas.
+A tabela tem rolagem horizontal, porque são muitas colunas. Embaixo dela, o **Registro** mostra cada evento com horário: aparelho novo, aparelho que saiu, nome descoberto, portas encontradas e alertas.
 
 ### 2.2. Pelo terminal, sem janela
 
@@ -122,11 +127,13 @@ Saída de exemplo (os MACs foram trocados):
 
 ```
 Varrendo 192.168.1.0/24 (timeout 500 ms)...
-Pronto em 6.8 s. 7 dispositivo(s):
-  192.168.1.1     F4-E8-4F-00-00-01 PING   2 ms  portas: 53 (DNS), 80 (HTTP), 443 (HTTPS)
+Pronto em 7.7 s. 8 dispositivo(s):
+  192.168.1.1     F4-E8-4F-00-00-01 PING   8 ms  portas: 53 (DNS), 80 (HTTP), 443 (HTTPS)
+                  fabricante: ZTE | nome: - | tipo provável: Roteador (gateway da rede)
   192.168.1.4     A8-E6-21-00-00-02 ARP       -  portas: nenhuma
-  192.168.1.18    A8-16-D0-00-00-03 PING 153 ms  portas: nenhuma
-  192.168.1.154   FE-CB-1F-00-00-04 PING  <1 ms  portas: nenhuma (este PC)
+                  fabricante: Amazon | nome: - | tipo provável: Aparelho Amazon (Echo/Fire TV/Kindle)
+  192.168.1.65    04-D9-F5-00-00-03 PING 188 ms  portas: nenhuma
+                  fabricante: ASUSTek COMPUTER | nome: Android-2 | tipo provável: Celular/tablet Android
 ```
 
 O aparelho `192.168.1.4` aparece com `ARP`: ele ignorou o ping, mas foi encontrado mesmo assim. No modo terminal, as portas testadas são sempre de 1 a 1024, com timeout de 300 ms.
@@ -148,6 +155,8 @@ para cada IP da rede (todos ao mesmo tempo):
 
 depois, para cada IP online (3 aparelhos por vez):
     testa as portas TCP do intervalo -> lista as abertas
+    ao mesmo tempo, pergunta o nome do aparelho (mDNS -> NetBIOS -> DNS)
+    fabricante (pelo MAC) + nome + portas + TTL -> tipo provável
 
 modo monitorar (a cada N segundos, repete tudo):
     faltou em 2 rodadas seguidas      -> OFFLINE (vermelho)
@@ -240,17 +249,40 @@ O NetProbe compara o MAC de cada IP de uma rodada para a outra:
 | **Mesmo MAC** em vários IPs | Observação "mesmo MAC que …". Pode ser um repetidor Wi-Fi, um aparelho com dois IPs ou ARP spoofing contra o roteador. |
 | MAC com o bit "administrado localmente" ligado | Observação "MAC aleatório (privacidade)". Android, iPhone e Windows inventam um MAC por rede. |
 
-Quando o MAC de um IP muda, as portas daquele IP são verificadas de novo, porque agora é outro aparelho.
+Quando o MAC de um IP muda, as portas e o nome daquele IP são verificados de novo, porque agora é outro aparelho.
 
 ---
 
-## 5. Desempenho
+## 5. Identificação dos aparelhos
+
+Um IP e um MAC sozinhos não dizem *o que* é o aparelho. O NetProbe junta quatro pistas, **sem root e sem acessar a internet**:
+
+| Pista | Como é obtida | O que revela |
+|---|---|---|
+| **Fabricante** | Os 3 primeiros bytes do MAC (o *OUI*) são registrados por fabricante no IEEE. O programa procura o prefixo no arquivo `fabricantes.txt`, com 58 mil fabricantes. | `F4-E8-4F` = ZTE, `A8-E6-21` = Amazon |
+| **Nome** | Pergunta ao próprio aparelho como ele se chama, em três tentativas: **mDNS** (porta UDP 5353: celulares, Apple, TVs, Chromecast, impressoras), **NetBIOS** (porta UDP 137: computadores Windows) e **DNS reverso** (o roteador às vezes sabe o nome). | `Android-2`, `iPhone-de-Ana`, `DESKTOP-AB12CD` |
+| **Portas abertas** | As da [seção 3.5](#35-portas-abertas-tcp-connect-scan) | 62078 = iPhone, 9100 = impressora, 445/3389 = Windows, 8008/8009 = Chromecast |
+| **TTL do ping** | Cada sistema começa o TTL num valor diferente | 64 = Linux/Android/Apple, 128 = Windows, 255 = equipamento de rede |
+
+O **Tipo provável** usa as pistas da mais forte para a mais fraca: é este PC? É o gateway da rede (então é o roteador)? Depois vêm o nome, as portas, o fabricante, o MAC aleatório e, por último, o TTL.
+
+Pontos importantes:
+
+- **É um palpite.** Um nome pode ser trocado pelo dono, e um fabricante como a Samsung faz celulares, TVs e geladeiras. Por isso a coluna se chama "Tipo provável".
+- **MAC aleatório não tem fabricante.** Celulares e notebooks modernos inventam um MAC por rede, justamente para não serem identificados. Nesse caso, a coluna Fabricante mostra "MAC aleatório (privado)".
+- **Nomes inúteis são descartados**, como `localhost`, `none` e o próprio IP escrito como nome.
+- **Atualizar a lista de fabricantes:** `python atualizar_fabricantes.py` baixa a cópia do registro do IEEE mantida pelo projeto Wireshark e gera o `fabricantes.txt` de novo. O NetProbe em si nunca acessa a internet, então funciona offline na apresentação.
+
+---
+
+## 6. Desempenho
 
 Medido num notebook com Linux (Fedora) e Wi-Fi doméstico, rede /24 com 7 aparelhos:
 
 | Operação | Tempo |
 |---|---|
 | Varredura completa da /24 (ping + ARP) | **~7 s** |
+| Varredura + portas 1 a 1024 + nomes de 8 aparelhos (interface) | ~11 s |
 | Mesma varredura, um IP por vez (estimativa) | mais de 25 min |
 | Portas 1 a 1024 do roteador (timeout de 300 ms) | ~0,3 s |
 | Resposta do botão **Parar** | ~0,25 s |
@@ -259,9 +291,9 @@ O tempo total depende principalmente dos IPs **vazios**. Cada um espera as duas 
 
 ---
 
-## 6. Testes automatizados
+## 7. Testes automatizados
 
-São 32 testes com `unittest`, da biblioteca padrão. Eles **não precisam de rede**:
+São 56 testes com `unittest`, da biblioteca padrão. Eles **não precisam de rede**:
 
 ```bash
 python -m unittest discover -s tests -v
@@ -269,17 +301,19 @@ python -m unittest discover -s tests -v
 
 | Arquivo | O que verifica |
 |---|---|
-| `tests/test_scanner.py` | Interpretação de saídas **reais** do `ping` (Windows em PT e EN, Linux) e da tabela ARP (`arp -a` e `ip neigh`), incluindo os casos de "host inacessível" sem TTL. Normalização de MAC e detecção de MAC aleatório. Validação do campo Rede. A lógica *ping → ARP → IP vazio*. Varredura de portas contra um **servidor TCP de verdade** em `127.0.0.1`. |
-| `tests/test_app.py` | A interface, simulando rodadas: cores de ping e ARP, OFFLINE só depois de 2 faltas, aparelho que volta, **colisão de IP**, IP reaproveitado pelo DHCP (que não é colisão), MAC repetido, MAC aleatório. Esses testes são pulados se não houver tela gráfica. |
+| `tests/test_scanner.py` | Interpretação de saídas **reais** do `ping` (Windows em PT e EN, Linux) e da tabela ARP (`arp -a` e `ip neigh`), incluindo os casos de "host inacessível" sem TTL. Normalização de MAC e detecção de MAC aleatório. Validação do campo Rede. A lógica *ping → ARP → IP vazio*. Varredura de portas contra um **servidor TCP de verdade** em `127.0.0.1`. **Identificação:** fabricante pelo `fabricantes.txt` real (inclusive blocos de 28/36 bits), respostas mDNS e NetBIOS montadas byte a byte, uma pergunta mDNS de verdade a um "aparelho" falso em `127.0.0.1`, gateway no Linux e no Windows, e o palpite do tipo. |
+| `tests/test_app.py` | A interface, simulando rodadas: cores de ping e ARP, OFFLINE só depois de 2 faltas, aparelho que volta, **colisão de IP**, IP reaproveitado pelo DHCP (que não é colisão), MAC repetido, MAC aleatório, colunas Nome, Tipo e Fabricante, nome mantido entre rodadas e apagado quando outro aparelho assume o IP. Esses testes são pulados se não houver tela gráfica. |
 
 ---
 
-## 7. Estrutura do código
+## 8. Estrutura do código
 
 ```
 NetProbe/
-├── scanner.py         parte de REDE, sem interface (dá para usar sozinho)
-├── app.py             a JANELA (Tkinter)
+├── scanner.py               parte de REDE, sem interface (dá para usar sozinho)
+├── app.py                   a JANELA (Tkinter)
+├── fabricantes.txt          prefixo do MAC -> fabricante (registro público do IEEE)
+├── atualizar_fabricantes.py gera o fabricantes.txt de novo
 └── tests/
     ├── test_scanner.py
     └── test_app.py
@@ -297,12 +331,15 @@ NetProbe/
 | `porta_aberta()` / `escanear_portas()` | TCP connect em uma porta / em um intervalo |
 | `em_paralelo()` | Roda tarefas em várias threads e confere o pedido de parar a cada 0,2 s |
 | `redes_sugeridas()` / `ler_rede()` | Descobre a rede deste PC / valida o campo Rede |
+| `fabricante()` | Fabricante pelo prefixo do MAC |
+| `descobrir_nome()` | Nome do aparelho por mDNS, NetBIOS ou DNS reverso |
+| `gateway_padrao()` / `palpite_tipo()` | IP do roteador / palpite do tipo de aparelho |
 
 **`app.py`:** a classe `NetProbeApp` monta a tela, recebe as mensagens da thread de varredura pela fila e mantém o estado de cada aparelho entre rodadas: status, faltas, MAC anterior e colisões.
 
 ---
 
-## 8. Roteiro para a apresentação
+## 9. Roteiro para a apresentação
 
 **Use o hotspot do celular**, não o Wi-Fi da faculdade. Redes de faculdade costumam isolar os aparelhos uns dos outros (*client isolation*), e nada seria encontrado.
 
@@ -324,16 +361,17 @@ NetProbe/
 3. **ARP:** aponte a linha **amarela**. O aparelho ignorou o ping e mesmo assim foi encontrado pelo ARP.
 4. **IP/MAC:** mostre os MACs e a observação "MAC aleatório" dos celulares.
 5. **Portas:** mostre as portas abertas, ex.: `53 (DNS)` e `80 (HTTP)` no celular do hotspot.
-6. **Tempo real:** marque **Monitorar em tempo real** (ex.: a cada 10 s) e **desligue o Wi-Fi de um aparelho**. Depois de duas rodadas ele fica **vermelho**. Religue e ele volta a ficar verde.
-7. **Parâmetros:** mude o **timeout do ping**, a **rede** e o **intervalo de portas** para mostrar que são configuráveis.
-8. **Exportar CSV** e abrir o arquivo no Excel.
-9. *(Opcional)* **Colisão de IP:** com o monitoramento ligado, desligue um aparelho e, antes que ele fique offline, configure **IP fixo** igual ao dele em outro aparelho. Na rodada seguinte, a linha fica **laranja**.
+6. **Identificação:** mostre as colunas Nome, Tipo provável e Fabricante. Explique que o MAC aleatório esconde o fabricante.
+7. **Tempo real:** marque **Monitorar em tempo real** (ex.: a cada 10 s) e **desligue o Wi-Fi de um aparelho**. Depois de duas rodadas ele fica **vermelho**. Religue e ele volta a ficar verde.
+8. **Parâmetros:** mude o **timeout do ping**, a **rede** e o **intervalo de portas** para mostrar que são configuráveis.
+9. **Exportar CSV** e abrir o arquivo no Excel.
+10. *(Opcional)* **Colisão de IP:** com o monitoramento ligado, desligue um aparelho e, antes que ele fique offline, configure **IP fixo** igual ao dele em outro aparelho. Na rodada seguinte, a linha fica **laranja**.
 
 > Para um aparelho Windows **responder** ping (ou deixar de responder): Firewall do Windows → Configurações avançadas → Regras de entrada → "Compartilhamento de Arquivo e Impressora (Solicitação de Eco - ICMPv4-In)".
 
 ---
 
-## 9. Limitações conhecidas
+## 10. Limitações conhecidas
 
 - **Sistemas:** funciona em Windows e Linux. No macOS não foi testado: o `ping` de lá tem outras opções, e o macOS não tem o comando `ip`.
 - **Só a rede local:** o ARP não passa pelo roteador. Em outra rede, o ping ainda funciona, mas os aparelhos que bloqueiam ping e os MACs não aparecem.
@@ -341,9 +379,10 @@ NetProbe/
 - **Colisão de IP:** é detectada **entre rodadas**, quando o MAC muda. Sem administrador/root, o sistema entrega só uma resposta ARP por IP. Por isso, dois aparelhos respondendo ao mesmo tempo, na mesma rodada, não são vistos.
 - **Portas:** o scan é do tipo *TCP connect*. Portas **UDP** não são testadas, e portas filtradas por firewall aparecem como fechadas.
 - **Tamanho da rede:** até 1024 IPs (/22) por varredura.
+- **Identificação:** o tipo é um palpite. Muitos aparelhos não anunciam nome nenhum, e quem usa MAC aleatório não revela o fabricante.
 
 ---
 
-## 10. Uso responsável
+## 11. Uso responsável
 
 Varredura de rede e de portas só deve ser feita em redes que **são suas** ou em que você tem **autorização** para testar, como a rede de casa ou o hotspot do próprio celular. Escanear redes de terceiros sem permissão pode violar políticas de uso e a legislação.

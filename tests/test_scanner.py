@@ -7,6 +7,7 @@ e ingles, Linux), entao funcionam em qualquer sistema, sem rede.
 """
 import ipaddress
 import socket
+import struct
 import sys
 import threading
 import unittest
@@ -117,11 +118,11 @@ class TestVerificarIp(unittest.TestCase):
     """A logica 'ping primeiro, ARP se o ping falhar', sem tocar na rede."""
 
     def test_respondeu_ping(self):
-        with mock.patch.object(scanner, "fazer_ping", return_value=3.0), \
+        with mock.patch.object(scanner, "fazer_ping", return_value=(3.0, 64)), \
              mock.patch.object(scanner, "sondar_arp", return_value="AA-BB-CC-DD-EE-01"), \
              mock.patch.object(scanner, "mac_da_tabela_arp", return_value="AA-BB-CC-DD-EE-01"):
             h = scanner.verificar_ip("10.0.0.5", 500, [])
-        self.assertEqual((h.metodo, h.mac, h.tempo_ms), ("PING", "AA-BB-CC-DD-EE-01", 3.0))
+        self.assertEqual((h.metodo, h.mac, h.tempo_ms, h.ttl), ("PING", "AA-BB-CC-DD-EE-01", 3.0, 64))
 
     def test_bloqueia_ping_mas_responde_arp(self):
         with mock.patch.object(scanner, "fazer_ping", return_value=None), \
@@ -199,6 +200,163 @@ class TestTextoTempo(unittest.TestCase):
         self.assertEqual(scanner.texto_tempo(0.4), "<1 ms")
         self.assertEqual(scanner.texto_tempo(2.87), "3 ms")
         self.assertEqual(scanner.texto_tempo(153), "153 ms")
+
+
+class TestTtl(unittest.TestCase):
+    def test_windows_e_linux(self):
+        self.assertEqual(scanner.interpretar_ttl("Resposta de 192.168.15.1: bytes=32 tempo=4ms TTL=128"), 128)
+        self.assertEqual(scanner.interpretar_ttl("64 bytes from 192.168.1.1: icmp_seq=1 ttl=64 time=2.87 ms"), 64)
+        self.assertIsNone(scanner.interpretar_ttl("Esgotado o tempo limite do pedido."))
+        self.assertIsNone(scanner.interpretar_ttl(None))
+
+
+class TestFabricante(unittest.TestCase):
+    """Usa o fabricantes.txt de verdade, que vem no projeto."""
+
+    def test_oui_de_24_bits(self):
+        self.assertEqual(scanner.fabricante("F4-E8-4F-98-1B-94"), "ZTE")
+        self.assertEqual(scanner.fabricante("A8-E6-21-A1-2D-07"), "Amazon")
+        self.assertIn("Samsung", scanner.fabricante("00-7D-3B-20-1D-78"))
+
+    def test_bloco_menor_tem_prioridade(self):
+        # 00-1B-C5 e dividido em blocos de 36 bits, cada um de uma empresa diferente
+        self.assertIn("Converging", scanner.fabricante("00-1B-C5-00-00-12"))
+        self.assertIn("OpenRB", scanner.fabricante("00-1B-C5-00-10-12"))
+
+    def test_mac_aleatorio_ou_vazio_nao_tem_fabricante(self):
+        self.assertIsNone(scanner.fabricante("6A-25-C6-23-AF-B0"))
+        self.assertIsNone(scanner.fabricante(None))
+
+    def test_propriedade_do_host(self):
+        self.assertEqual(scanner.Host("10.0.0.1", "F4-E8-4F-00-00-01", "PING", 1).fabricante, "ZTE")
+
+
+def _resposta_mdns(nome_ptr: str, com_pergunta: bool = True) -> bytes:
+    """Monta uma resposta mDNS como a de um celular: 'meu nome e <nome_ptr>'."""
+    def codificar(nome):
+        return b"".join(bytes([len(p)]) + p.encode() for p in nome.split(".")) + b"\x00"
+    pergunta = codificar("18.1.168.192.in-addr.arpa") + struct.pack(">HH", 12, 0x8001)
+    rdata = codificar(nome_ptr)
+    if com_pergunta:
+        cab = struct.pack(">HHHHHH", 0, 0x8400, 1, 1, 0, 0)
+        resposta = b"\xc0\x0c"            # ponteiro para o nome da pergunta (compressao)
+        corpo = pergunta
+    else:
+        cab = struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 0)
+        resposta = codificar("18.1.168.192.in-addr.arpa")
+        corpo = b""
+    resposta += struct.pack(">HHIH", 12, 0x8001, 120, len(rdata)) + rdata
+    return cab + corpo + resposta
+
+
+def _resposta_netbios(nomes) -> bytes:
+    """Resposta NetBIOS Node Status com a lista (nome, sufixo, e_grupo)."""
+    corpo = bytes([len(nomes)])
+    for nome, sufixo, grupo in nomes:
+        corpo += nome.ljust(15).encode() + bytes([sufixo]) + struct.pack(">H", 0x8400 if grupo else 0x0400)
+    return b"\x00" * 56 + corpo
+
+
+class TestNomes(unittest.TestCase):
+    def test_mdns_com_compressao(self):
+        self.assertEqual(scanner.interpretar_mdns(_resposta_mdns("Android.local")), "Android.local")
+
+    def test_mdns_sem_pergunta(self):
+        self.assertEqual(scanner.interpretar_mdns(_resposta_mdns("iPhone-de-Ana.local", False)),
+                         "iPhone-de-Ana.local")
+
+    def test_mdns_pacote_quebrado(self):
+        self.assertIsNone(scanner.interpretar_mdns(b"\x00\x01\x02"))
+        self.assertIsNone(scanner.interpretar_mdns(_resposta_mdns("Android.local")[:-6]))
+
+    def test_pergunta_mdns_e_ptr_do_ip_invertido(self):
+        q = scanner.pergunta_mdns("192.168.1.18")
+        self.assertIn(b"\x0218\x011\x03168\x03192\x07in-addr\x04arpa\x00", q)
+        self.assertEqual(q[-4:], struct.pack(">HH", 12, 0x8001))
+
+    def test_netbios_pega_o_nome_do_computador_e_nao_o_grupo(self):
+        dados = _resposta_netbios([("WORKGROUP", 0x00, True), ("DESKTOP-AB12CD", 0x00, False),
+                                   ("DESKTOP-AB12CD", 0x20, False)])
+        self.assertEqual(scanner.interpretar_netbios(dados), "DESKTOP-AB12CD")
+        self.assertIsNone(scanner.interpretar_netbios(b"\x00" * 10))
+
+    def test_limpar_nome(self):
+        self.assertEqual(scanner.limpar_nome("Android.local.", "192.168.1.18"), "Android")
+        self.assertEqual(scanner.limpar_nome("notebook-joao.lan", "192.168.1.9"), "notebook-joao")
+        for inutil in ("localhost.local", "none.local", "unknown", "_gateway", "192.168.1.18", "192-168-1-18.provedor.net", "", None):
+            self.assertIsNone(scanner.limpar_nome(inutil, "192.168.1.18"), inutil)
+
+    def test_descobrir_nome_usa_o_primeiro_que_funcionar(self):
+        with mock.patch.object(scanner, "nome_mdns", return_value=None), \
+             mock.patch.object(scanner, "nome_netbios", return_value="DESKTOP-AB12CD"), \
+             mock.patch.object(scanner, "nome_dns_reverso") as dns:
+            self.assertEqual(scanner.descobrir_nome("10.0.0.2"), "DESKTOP-AB12CD")
+        dns.assert_not_called()
+
+    def test_mdns_de_verdade_numa_porta_local(self):
+        """Um 'aparelho' falso em 127.0.0.1 responde a pergunta pela rede de verdade."""
+        servidor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        servidor.bind(("127.0.0.1", 0))
+        porta = servidor.getsockname()[1]
+
+        def responder():
+            _, origem = servidor.recvfrom(512)
+            servidor.sendto(_resposta_mdns("Galaxy-S23.local"), origem)
+        threading.Thread(target=responder, daemon=True).start()
+        try:
+            dados = scanner._perguntar_udp("127.0.0.1", porta, scanner.pergunta_mdns("127.0.0.1"), 2)
+        finally:
+            servidor.close()
+        self.assertEqual(scanner.interpretar_mdns(dados), "Galaxy-S23.local")
+
+
+class TestGateway(unittest.TestCase):
+    def test_linux(self):
+        saida = "default via 192.168.1.1 dev wlp3s0 proto dhcp src 192.168.1.154 metric 600\n"
+        self.assertEqual(scanner.ler_gateway(saida), "192.168.1.1")
+
+    def test_windows(self):
+        saida = ("IPv4 Route Table\r\n=====\r\nActive Routes:\r\n"
+                 "Network Destination        Netmask          Gateway       Interface  Metric\r\n"
+                 "          0.0.0.0          0.0.0.0     192.168.15.1    192.168.15.6     35\r\n")
+        self.assertEqual(scanner.ler_gateway(saida), "192.168.15.1")
+
+    def test_sem_gateway(self):
+        self.assertIsNone(scanner.ler_gateway(""))
+
+
+class TestPalpiteTipo(unittest.TestCase):
+    def host(self, mac="0C-00-00-00-00-01",   # prefixo nao registrado
+             nome=None, portas=(), ttl=None, ip="10.0.0.9"):
+        h = scanner.Host(ip, mac, "PING", 1, portas=list(portas), ttl=ttl)
+        h.nome = nome
+        return h
+
+    def test_este_pc_e_roteador(self):
+        self.assertEqual(scanner.palpite_tipo(scanner.Host("10.0.0.2", None, "PING", 0, este_pc=True)),
+                         "Este computador")
+        self.assertIn("Roteador", scanner.palpite_tipo(self.host(ip="10.0.0.1"), gateway="10.0.0.1"))
+
+    def test_nome_e_a_pista_mais_forte(self):
+        self.assertEqual(scanner.palpite_tipo(self.host(nome="iPhone-de-Ana")), "iPhone")
+        self.assertEqual(scanner.palpite_tipo(self.host(nome="Android-2")), "Celular/tablet Android")
+        self.assertEqual(scanner.palpite_tipo(self.host(nome="DESKTOP-AB12CD", portas=[22])),
+                         "Computador Windows")
+
+    def test_portas(self):
+        self.assertEqual(scanner.palpite_tipo(self.host(portas=[80, 9100])), "Impressora")
+        self.assertEqual(scanner.palpite_tipo(self.host(portas=[445, 139])), "Computador Windows")
+        self.assertEqual(scanner.palpite_tipo(self.host(portas=[62078])), "iPhone/iPad")
+
+    def test_fabricante(self):
+        self.assertIn("Amazon", scanner.palpite_tipo(self.host(mac="A8-E6-21-A1-2D-07")))
+        self.assertIn("Samsung", scanner.palpite_tipo(self.host(mac="00-7D-3B-20-1D-78")))
+
+    def test_mac_aleatorio_e_ttl(self):
+        self.assertIn("MAC privado", scanner.palpite_tipo(self.host(mac="6A-25-C6-23-AF-B0")))
+        self.assertEqual(scanner.palpite_tipo(self.host(ttl=128)), "Computador Windows")
+        self.assertEqual(scanner.palpite_tipo(self.host(ttl=255)), "Equipamento de rede")
+        self.assertEqual(scanner.palpite_tipo(self.host()), "")
 
 
 if __name__ == "__main__":

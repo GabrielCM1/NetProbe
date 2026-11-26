@@ -1,11 +1,12 @@
 """
 NetProbe - parte de REDE (sem interface).
 
-Aqui ficam as 4 tecnicas de rede do trabalho:
+Aqui ficam as tecnicas de rede do trabalho:
   1. fazer_ping()       -> Varredura ICMP (ping sweep)
   2. sondar_arp()       -> Sondagem ARP para quem nao respondeu ao ping
   3. verificar_ip()     -> junta 1 + 2 e monta o par IP/MAC
   4. escanear_portas()  -> lista as portas TCP abertas de um IP
+  5. descobrir_nome(), fabricante(), palpite_tipo() -> identifica QUE aparelho e
 
 Funciona no Windows e no Linux, so com bibliotecas que ja vem com o Python,
 e sem precisar de administrador/root.
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -34,10 +36,11 @@ SEM_JANELA = 0x08000000  # CREATE_NO_WINDOW
 SERVICOS = {
     20: "FTP-dados", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
     67: "DHCP", 80: "HTTP", 110: "POP3", 135: "RPC", 139: "NetBIOS", 143: "IMAP",
-    443: "HTTPS", 445: "SMB", 554: "RTSP", 631: "Impressora", 1900: "UPnP",
+    443: "HTTPS", 445: "SMB", 515: "Impressora", 548: "AFP (Mac)", 554: "RTSP",
+    631: "Impressora", 1883: "MQTT (IoT)", 1900: "UPnP",
     3306: "MySQL", 3389: "Área Remota", 5000: "UPnP/Flask", 5357: "WSD",
-    7000: "AirPlay", 8008: "HTTP-alt", 8080: "HTTP-alt", 8443: "HTTPS-alt",
-    9100: "Impressora", 62078: "iPhone-sync",
+    7000: "AirPlay", 8008: "Chromecast", 8009: "Chromecast", 8080: "HTTP-alt",
+    8443: "HTTPS-alt", 9100: "Impressora", 62078: "iPhone-sync",
 }
 
 
@@ -50,6 +53,13 @@ class Host:
     tempo_ms: Optional[float]   # tempo de resposta do ping (None se veio do ARP)
     este_pc: bool = False       # True se for o proprio computador que esta varrendo
     portas: List[int] = field(default_factory=list)
+    ttl: Optional[int] = None   # TTL da resposta do ping (da uma pista do sistema operacional)
+    nome: Optional[str] = None  # nome que o aparelho anuncia (mDNS, NetBIOS ou DNS)
+
+    @property
+    def fabricante(self) -> Optional[str]:
+        """Fabricante da placa de rede, pelos 3 primeiros bytes do MAC."""
+        return fabricante(self.mac)
 
 
 # --------------------------------------------------------------------------
@@ -190,8 +200,14 @@ def interpretar_ping(saida: Optional[str]) -> Optional[float]:
     return float(m.group(1).replace(",", ".")) if m else 0.0
 
 
-def fazer_ping(ip: str, timeout_ms: int) -> Optional[float]:
-    """Manda 1 ping. Devolve o tempo de resposta em ms, ou None se nao respondeu.
+def interpretar_ttl(saida: Optional[str]) -> Optional[int]:
+    """'... TTL=128' ou '... ttl=64 ...' -> 128 / 64."""
+    m = re.search(r"TTL=(\d+)", saida or "", re.I)
+    return int(m.group(1)) if m else None
+
+
+def fazer_ping(ip: str, timeout_ms: int) -> Optional[Tuple[float, Optional[int]]]:
+    """Manda 1 ping. Devolve (tempo de resposta em ms, TTL), ou None se nao respondeu.
 
     Windows:  ping -n 1 -w <ms>  (um pacote, timeout em milissegundos)
     Linux:    ping -c 1 -W <s>   (um pacote, timeout em segundos, aceita fracao)"""
@@ -199,7 +215,9 @@ def fazer_ping(ip: str, timeout_ms: int) -> Optional[float]:
         comando = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
     else:
         comando = ["ping", "-c", "1", "-n", "-W", "%.3f" % (timeout_ms / 1000), ip]
-    return interpretar_ping(_executar(comando, timeout=timeout_ms / 1000 + 3))
+    saida = _executar(comando, timeout=timeout_ms / 1000 + 3)
+    tempo = interpretar_ping(saida)
+    return None if tempo is None else (tempo, interpretar_ttl(saida))
 
 
 # --------------------------------------------------------------------------
@@ -363,16 +381,17 @@ def verificar_ip(ip: str, timeout_ms: int, meus_ips: List[str]) -> Optional[Host
     - Nao respondeu, mas ARP sim  -> online, metodo ARP (o dispositivo bloqueia ping)
     - Nenhum dos dois             -> IP vazio, devolve None"""
     if ip in meus_ips:
-        return Host(ip, mac_deste_pc(ip), "PING", 0, este_pc=True)
+        return Host(ip, mac_deste_pc(ip), "PING", 0, este_pc=True, nome=socket.gethostname())
 
-    tempo = fazer_ping(ip, timeout_ms)
-    if tempo is not None:
+    resposta = fazer_ping(ip, timeout_ms)
+    if resposta is not None:
+        tempo, ttl = resposta
         # Ja sabemos que existe. O ping ja fez o ARP, entao o MAC esta no cache.
         if WINDOWS:
             mac = sondar_arp(ip, tentativas=2) or mac_da_tabela_arp(ip)
         else:
             mac = mac_da_tabela_arp(ip) or sondar_arp(ip, tentativas=1)
-        return Host(ip, mac, "PING", tempo)
+        return Host(ip, mac, "PING", tempo, ttl=ttl)
 
     mac = sondar_arp(ip, tentativas=2)   # 2 tentativas: aparelhos dormindo demoram a responder
     if mac is not None:
@@ -440,6 +459,270 @@ def texto_tempo(tempo_ms: Optional[float]) -> str:
 
 
 # --------------------------------------------------------------------------
+# 5. Identificar o aparelho: fabricante, nome e tipo provavel
+# --------------------------------------------------------------------------
+# Nenhuma destas tecnicas precisa de root, e nenhuma acessa a internet:
+#   - FABRICANTE: os 3 primeiros bytes do MAC (OUI) sao registrados por fabricante no IEEE.
+#     A lista fica no arquivo fabricantes.txt (gerado por atualizar_fabricantes.py).
+#   - NOME: pergunta ao proprio aparelho como ele se chama, por mDNS (celulares, Apple,
+#     TVs, Chromecast, impressoras), NetBIOS (Windows) ou DNS reverso (roteador).
+#   - TIPO PROVAVEL: um palpite juntando nome, portas abertas, fabricante e TTL.
+ARQUIVO_FABRICANTES = Path(__file__).resolve().parent / "fabricantes.txt"
+_fabricantes: Optional[Dict[str, str]] = None
+_fabricantes_trava = threading.Lock()
+
+
+def carregar_fabricantes() -> Dict[str, str]:
+    """Le o fabricantes.txt uma unica vez: {'F4E84F': 'ZTE', ...}. Sem o arquivo, fica vazio."""
+    global _fabricantes
+    with _fabricantes_trava:
+        if _fabricantes is None:
+            tabela = {}
+            try:
+                with open(ARQUIVO_FABRICANTES, encoding="utf-8") as f:
+                    for linha in f:
+                        if not linha.startswith("#"):
+                            prefixo, _, nome = linha.rstrip("\n").partition("\t")
+                            if nome:
+                                tabela[prefixo] = nome
+            except OSError:
+                pass
+            _fabricantes = tabela
+        return _fabricantes
+
+
+def fabricante(mac: Optional[str]) -> Optional[str]:
+    """'A8-E6-21-A1-2D-07' -> 'Amazon'. None se nao souber.
+    MAC aleatorio nao tem fabricante: ele foi inventado pelo aparelho, por privacidade."""
+    if not mac or mac_aleatorio(mac):
+        return None
+    hexa = mac.replace("-", "").upper()
+    tabela = carregar_fabricantes()
+    for tamanho in (9, 7, 6):        # blocos menores (36 e 28 bits) primeiro, depois o OUI de 24 bits
+        nome = tabela.get(hexa[:tamanho])
+        if nome:
+            return nome
+    return None
+
+
+def _nome_dns(dados: bytes, pos: int) -> Tuple[str, int]:
+    """Le um nome no formato DNS ('\\x07Android\\x05local\\x00', com compressao).
+    Devolve (nome, posicao logo depois dele)."""
+    partes, depois = [], None
+    for _ in range(128):                         # protege contra pacote malformado
+        n = dados[pos]
+        if n == 0:
+            pos += 1
+            break
+        if n & 0xC0 == 0xC0:                     # ponteiro: o resto do nome esta em outro lugar
+            if depois is None:
+                depois = pos + 2
+            pos = ((n & 0x3F) << 8) | dados[pos + 1]
+            continue
+        partes.append(dados[pos + 1:pos + 1 + n].decode("utf-8", errors="ignore"))
+        pos += 1 + n
+    return ".".join(partes), (depois if depois is not None else pos)
+
+
+def pergunta_mdns(ip: str) -> bytes:
+    """Pergunta DNS do tipo PTR: 'qual o nome de 18.1.168.192.in-addr.arpa?'"""
+    nome = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+    corpo = b"".join(bytes([len(p)]) + p.encode() for p in nome.split(".")) + b"\x00"
+    # cabecalho: id 0, 1 pergunta | tipo 12 = PTR, classe 0x8001 = IN + "responda direto para mim"
+    return struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0) + corpo + struct.pack(">HH", 12, 0x8001)
+
+
+def interpretar_mdns(dados: bytes) -> Optional[str]:
+    """Tira o nome da resposta mDNS (o primeiro registro PTR). Ex.: 'Android.local'."""
+    try:
+        perguntas, respostas = struct.unpack(">HH", dados[4:8])
+        pos = 12
+        for _ in range(perguntas):
+            pos = _nome_dns(dados, pos)[1] + 4
+        for _ in range(respostas):
+            pos = _nome_dns(dados, pos)[1]
+            tipo, _, _, tamanho = struct.unpack(">HHIH", dados[pos:pos + 10])
+            pos += 10
+            if tipo == 12:
+                return _nome_dns(dados, pos)[0]
+            pos += tamanho
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
+def interpretar_netbios(dados: bytes) -> Optional[str]:
+    """Tira o nome do computador da resposta NetBIOS 'Node Status'.
+    Cada nome ocupa 18 bytes: 15 do nome + 1 de sufixo + 2 de flags.
+    O nome do computador e o de sufixo 0x00 que nao e de grupo."""
+    try:
+        quantos = dados[56]
+        for i in range(quantos):
+            e = dados[57 + 18 * i:57 + 18 * (i + 1)]
+            nome = e[:15].decode("ascii", errors="ignore").strip()
+            if nome and e[15] == 0x00 and not (struct.unpack(">H", e[16:18])[0] & 0x8000):
+                return nome
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
+def _perguntar_udp(ip: str, porta: int, pacote: bytes, timeout: float) -> Optional[bytes]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(pacote, (ip, porta))
+            while True:
+                dados, origem = s.recvfrom(4096)
+                if origem[0] == ip:
+                    return dados
+    except OSError:                     # timeout, porta fechada, rede inacessivel...
+        return None
+
+
+def nome_mdns(ip: str, timeout: float = 1.0) -> Optional[str]:
+    dados = _perguntar_udp(ip, 5353, pergunta_mdns(ip), timeout)
+    return interpretar_mdns(dados) if dados else None
+
+
+def nome_netbios(ip: str, timeout: float = 0.8) -> Optional[str]:
+    # Pergunta "Node Status" para o nome curinga '*' (codificado como CKAAAA...)
+    pacote = (struct.pack(">HHHHHH", 0x4E50, 0, 1, 0, 0, 0) + b"\x20" + b"CK" + b"A" * 30
+              + b"\x00" + struct.pack(">HH", 0x21, 1))
+    dados = _perguntar_udp(ip, 137, pacote, timeout)
+    return interpretar_netbios(dados) if dados else None
+
+
+def nome_dns_reverso(ip: str) -> Optional[str]:
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except (OSError, UnicodeError):
+        return None
+
+
+# Nomes provisorios que alguns aparelhos anunciam quando nao tem nome configurado
+_NOMES_VAZIOS = {"localhost", "none", "(none)", "unknown", "null", "default"}
+
+
+def limpar_nome(nome: Optional[str], ip: str) -> Optional[str]:
+    """'Android.local' -> 'Android'. Descarta nomes que nao dizem nada
+    ('localhost', 'none', '_gateway', o proprio IP, '192-168-1-18.provedor.com')."""
+    if not nome:
+        return None
+    nome = nome.strip().rstrip(".")
+    for sufixo in (".local", ".lan", ".home", ".localdomain", ".home.arpa"):
+        if nome.lower().endswith(sufixo):
+            nome = nome[: -len(sufixo)]
+    if (not nome or nome.startswith("_") or nome.lower() in _NOMES_VAZIOS
+            or re.fullmatch(r"[\d.\-]+", nome) or ip.replace(".", "-") in nome or ip in nome):
+        return None
+    return nome
+
+
+def descobrir_nome(ip: str) -> Optional[str]:
+    """Tenta mDNS, depois NetBIOS, depois DNS reverso. Devolve o primeiro nome util."""
+    for metodo in (nome_mdns, nome_netbios, nome_dns_reverso):
+        nome = limpar_nome(metodo(ip), ip)
+        if nome:
+            return nome
+    return None
+
+
+def ler_gateway(saida: str) -> Optional[str]:
+    """IP do roteador na saida de 'ip -4 route show default' (Linux)
+    ou de 'route print -4 0.0.0.0' (Windows)."""
+    m = (re.search(r"default via (\d+\.\d+\.\d+\.\d+)", saida)
+         or re.search(r"^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)", saida, re.M))
+    return m.group(1) if m else None
+
+
+def gateway_padrao() -> Optional[str]:
+    """IP do roteador (gateway padrao) desta rede."""
+    if WINDOWS:
+        saida = _executar(["route", "print", "-4", "0.0.0.0"])
+    else:
+        saida = _executar(["ip", "-4", "route", "show", "default"])
+    return ler_gateway(saida or "")
+
+
+# Pistas para o palpite do tipo de aparelho, da mais forte para a mais fraca.
+_PISTAS_NOME = [
+    (("iphone",), "iPhone"),
+    (("ipad",), "iPad"),
+    (("macbook", "imac", "mac-mini", "macmini"), "Mac"),
+    (("appletv", "apple-tv"), "Apple TV"),
+    (("android", "galaxy", "redmi", "poco", "moto", "pixel", "xiaomi"), "Celular/tablet Android"),
+    (("chromecast", "googletv", "google-tv"), "Chromecast / Google TV"),
+    (("echo", "alexa", "firetv", "fire-tv", "kindle"), "Aparelho Amazon (Echo/Fire TV)"),
+    (("printer", "epson", "brother", "canon", "laserjet", "deskjet", "officejet"), "Impressora"),
+    (("desktop-", "laptop-", "notebook"), "Computador Windows"),
+    (("raspberrypi",), "Raspberry Pi"),
+    (("esp_", "esp-", "esp32", "esp8266", "tasmota", "shelly", "sonoff"), "Casa inteligente (IoT)"),
+    (("tv", "bravia", "roku", "tizen", "webos"), "Smart TV"),
+]
+_PISTAS_PORTAS = [
+    ({62078}, "iPhone/iPad"),
+    ({9100, 515, 631}, "Impressora"),
+    ({8008, 8009}, "Chromecast / Smart TV"),
+    ({3389, 445, 139, 135}, "Computador Windows"),
+    ({548}, "Mac"),
+    ({7000}, "Aparelho com AirPlay (Apple TV, Mac, caixa de som)"),
+    ({554}, "Câmera IP ou Smart TV"),
+    ({1883}, "Casa inteligente (IoT)"),
+    ({53}, "Roteador / equipamento de rede"),
+    ({22}, "Computador Linux / servidor"),
+]
+_PISTAS_FABRICANTE = [
+    (("apple",), "Aparelho Apple (iPhone, iPad, Mac)"),
+    (("amazon",), "Aparelho Amazon (Echo/Fire TV/Kindle)"),
+    (("google",), "Aparelho Google (Chromecast/Nest)"),
+    (("espressif", "tuya", "shelly", "itead", "sonoff"), "Casa inteligente (IoT)"),
+    (("raspberry",), "Raspberry Pi"),
+    (("sony interactive", "nintendo"), "Videogame"),
+    (("hikvision", "dahua", "ezviz"), "Câmera de segurança"),
+    (("epson", "canon", "brother", "xerox", "lexmark", "kyocera", "ricoh", "hp inc",
+      "hewlett"), "Impressora"),
+    (("tp-link", "intelbras", "d-link", "mercusys", "ubiquiti", "mikrotik", "netgear", "tenda",
+      "arris", "technicolor", "sagemcom", "askey", "mitrastar", "commscope"),
+     "Roteador / equipamento de rede"),
+    (("intel", "realtek", "liteon", "lite-on", "azurewave", "hon hai", "cloud network"),
+     "Computador / notebook"),
+    (("xiaomi", "motorola", "oneplus", "oppo", "vivo mobile", "realme", "huawei device"),
+     "Celular (provável)"),
+    (("samsung",), "Aparelho Samsung (celular, TV...)"),
+    (("lg electronics",), "Aparelho LG (TV, celular...)"),
+]
+
+
+def palpite_tipo(h: Host, gateway: Optional[str] = None) -> str:
+    """Palpite de QUE aparelho e, juntando as pistas. Devolve '' se nao der para saber.
+    E um palpite: um nome ou uma porta podem enganar."""
+    if h.este_pc:
+        return "Este computador"
+    if gateway and h.ip == gateway:
+        return "Roteador (gateway da rede)"
+    nome, fab, portas = (h.nome or "").lower(), (h.fabricante or "").lower(), set(h.portas)
+    for chaves, tipo in _PISTAS_NOME:
+        if any(c in nome for c in chaves):
+            return tipo
+    for chaves, tipo in _PISTAS_PORTAS:
+        if portas & chaves:
+            return tipo
+    for chaves, tipo in _PISTAS_FABRICANTE:
+        if any(c in fab for c in chaves):
+            return tipo
+    if mac_aleatorio(h.mac):
+        return "Celular ou notebook (MAC privado)"
+    if h.ttl:                         # TTL inicial: 64 Linux/Android/Apple, 128 Windows, 255 rede
+        if h.ttl > 128:
+            return "Equipamento de rede"
+        if h.ttl > 64:
+            return "Computador Windows"
+        return "Linux, Android ou Apple"
+    return ""
+
+
+# --------------------------------------------------------------------------
 # Teste rapido pelo terminal:  python scanner.py 192.168.15.0/24 [timeout_ms]
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -452,9 +735,13 @@ if __name__ == "__main__":
     t0 = time.time()
     hosts = varrer_rede(rede, timeout, lambda ip, h: None)
     print("Pronto em %.1f s. %d dispositivo(s):" % (time.time() - t0, len(hosts)))
+    gateway = gateway_padrao()
     for h in hosts:
         h.portas = escanear_portas(h.ip, 1, 1024, 300)
-        extra = " (este PC)" if h.este_pc else ""
-        print("  %-15s %-17s %-4s %6s  portas: %s%s" % (
+        h.nome = None if h.este_pc else descobrir_nome(h.ip)
+        print("  %-15s %-17s %-4s %6s  portas: %s" % (
             h.ip, h.mac or "?", h.metodo, texto_tempo(h.tempo_ms),
-            ", ".join(nome_porta(p) for p in h.portas) or "nenhuma", extra))
+            ", ".join(nome_porta(p) for p in h.portas) or "nenhuma"))
+        print("  %15s fabricante: %s | nome: %s | tipo provável: %s" % (
+            "", h.fabricante or ("MAC aleatório" if mac_aleatorio(h.mac) else "?"),
+            h.nome or "-", palpite_tipo(h, gateway) or "?"))

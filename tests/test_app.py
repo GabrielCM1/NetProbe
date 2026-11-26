@@ -83,7 +83,30 @@ class TestInterface(unittest.TestCase):
 
     def test_mac_aleatorio_sinalizado(self):
         self.rodada([scanner.Host("10.0.0.3", "6A-25-C6-23-AF-B0", "PING", 2)])
-        self.assertIn("MAC aleatório", self.linha("10.0.0.3")["obs"])
+        self.assertIn("MAC aleatório", self.linha("10.0.0.3")["fabricante"])
+        self.assertIn("MAC privado", self.linha("10.0.0.3")["tipo"])
+
+    def test_fabricante_e_tipo_do_roteador(self):
+        self.app.gateway = "10.0.0.1"
+        self.rodada([scanner.Host("10.0.0.1", "F4-E8-4F-98-1B-94", "PING", 2, ttl=64)])
+        self.assertEqual(self.linha("10.0.0.1")["fabricante"], "ZTE")
+        self.assertIn("Roteador", self.linha("10.0.0.1")["tipo"])
+
+    def test_nome_descoberto_aparece_e_fica_entre_rodadas(self):
+        self.rodada([scanner.Host("10.0.0.7", "00-11-22-33-44-07", "PING", 2)])
+        self.assertEqual(self.linha("10.0.0.7")["nome"], "-")
+        self.app.fila.put(("nome", "10.0.0.7", "Android-2"))
+        self.app._processar_fila()
+        self.assertEqual(self.linha("10.0.0.7")["nome"], "Android-2")
+        self.assertEqual(self.linha("10.0.0.7")["tipo"], "Celular/tablet Android")
+        self.rodada([scanner.Host("10.0.0.7", "00-11-22-33-44-07", "ARP", None)])
+        self.assertEqual(self.linha("10.0.0.7")["nome"], "Android-2")
+
+    def test_outro_aparelho_no_ip_perde_o_nome_antigo(self):
+        self.rodada([scanner.Host("10.0.0.7", "00-11-22-33-44-07", "PING", 2)])
+        self.app.fila.put(("nome", "10.0.0.7", "Android-2"))
+        self.rodada([scanner.Host("10.0.0.7", "00-11-22-33-44-99", "PING", 2)])
+        self.assertEqual(self.linha("10.0.0.7")["nome"], "-")
 
     def test_arp_que_falhou_mantem_mac_anterior_sem_colisao(self):
         self.rodada([scanner.Host("10.0.0.4", "00-11-22-33-44-04", "PING", 2)])
