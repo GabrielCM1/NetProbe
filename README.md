@@ -64,7 +64,7 @@ sudo apt install python3-tk           # Ubuntu / Debian
 
 ### Monitor local no servidor B (escopo 4.2)
 
-Na branch `monitor-local`, execute no computador B, com o mesmo Python que abre o NetProbe:
+Execute no computador B, com o mesmo Python que abre o NetProbe:
 
 ```bash
 python -m pip install -r requirements-monitor.txt

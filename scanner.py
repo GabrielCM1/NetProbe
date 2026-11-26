@@ -618,56 +618,6 @@ def nome_porta(p: int) -> str:
     return "%d (%s)" % (p, nome) if nome else str(p)
 
 
-# --------------------------------------------------------------------------
-# Fabricante pelo MAC
-# --------------------------------------------------------------------------
-# Os 3 primeiros bytes do MAC (o "OUI") são comprados pelo fabricante e registrados
-# publicamente pelo IEEE. Ex.: F4-E8-4F-... = ZTE. A lista fica em fabricantes.txt
-# (cópia do registro do IEEE mantida pelo Wireshark). O programa não acessa a internet.
-ARQUIVO_FABRICANTES = Path(__file__).resolve().parent / "fabricantes.txt"   # na pasta do projeto
-_fabricantes: Optional[Dict[str, str]] = None    # a lista na memória (None = ainda não leu)
-
-
-def carregar_fabricantes() -> Dict[str, str]:
-    """Le o fabricantes.txt so na 1a vez: {'F4E84F': 'ZTE', ...}. Sem o arquivo, fica vazio."""
-    global _fabricantes
-    # Só lê o arquivo na primeira chamada. Nas outras, devolve o que já está na memória
-    # (o arquivo tem quase 59 mil linhas; ler a cada aparelho seria lento).
-    if _fabricantes is None:
-        tabela = {}
-        try:
-            with open(ARQUIVO_FABRICANTES, encoding="utf-8") as f:
-                for linha in f:
-                    # Cada linha: PREFIXO<TAB>FABRICANTE. partition separa no TAB.
-                    prefixo, _, nome = linha.rstrip("\n").partition("\t")
-                    # Ignora as linhas de comentário (começam com "#").
-                    if nome and not linha.startswith("#"):
-                        tabela[prefixo] = nome
-        except OSError:
-            pass                                  # sem o arquivo: tabela vazia, sem erro
-        _fabricantes = tabela
-    return _fabricantes
-
-
-def fabricante(mac: Optional[str]) -> Optional[str]:
-    """'F4-E8-4F-98-1B-94' -> 'ZTE'. None se nao souber.
-    MAC aleatorio nao tem fabricante: foi inventado pelo aparelho, por privacidade."""
-    # Passo 1: MAC vazio ou aleatório não tem fabricante.
-    if not mac or mac_aleatorio(mac):
-        return None
-    # Passo 2: tira os traços: "F4-E8-4F-98-1B-94" -> "F4E84F981B94".
-    hexa = mac.replace("-", "")
-    tabela = carregar_fabricantes()
-    # O IEEE também vende blocos menores (prefixos de 7 e 9 dígitos) dentro de um OUI,
-    # então o prefixo mais longo é procurado primeiro.
-    # Passo 3: tenta os 9 primeiros dígitos, depois 7, depois 6 (o OUI comum).
-    for tamanho in (9, 7, 6):
-        nome = tabela.get(hexa[:tamanho])
-        if nome:
-            return nome
-    return None
-
-
 def texto_tempo(tempo_ms: Optional[float]) -> str:
     """2.87 -> '3 ms';  0.4 -> '<1 ms';  None -> '-'."""
     if tempo_ms is None:
