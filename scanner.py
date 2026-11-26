@@ -477,49 +477,6 @@ def nome_porta(p: int) -> str:
     return "%d (%s)" % (p, nome) if nome else str(p)
 
 
-# --------------------------------------------------------------------------
-# Fabricante pelo MAC
-# --------------------------------------------------------------------------
-# Os 3 primeiros bytes do MAC (o "OUI") sao comprados pelo fabricante e registrados
-# publicamente pelo IEEE. Ex.: F4-E8-4F-... = ZTE. A lista fica em fabricantes.txt
-# (copia do registro do IEEE mantida pelo Wireshark). O programa nao acessa a internet.
-ARQUIVO_FABRICANTES = Path(__file__).resolve().parent / "fabricantes.txt"
-_fabricantes: Optional[Dict[str, str]] = None
-
-
-def carregar_fabricantes() -> Dict[str, str]:
-    """Le o fabricantes.txt so na 1a vez: {'F4E84F': 'ZTE', ...}. Sem o arquivo, fica vazio."""
-    global _fabricantes
-    if _fabricantes is None:
-        tabela = {}
-        try:
-            with open(ARQUIVO_FABRICANTES, encoding="utf-8") as f:
-                for linha in f:
-                    prefixo, _, nome = linha.rstrip("\n").partition("\t")
-                    if nome and not linha.startswith("#"):
-                        tabela[prefixo] = nome
-        except OSError:
-            pass
-        _fabricantes = tabela
-    return _fabricantes
-
-
-def fabricante(mac: Optional[str]) -> Optional[str]:
-    """'F4-E8-4F-98-1B-94' -> 'ZTE'. None se nao souber.
-    MAC aleatorio nao tem fabricante: foi inventado pelo aparelho, por privacidade."""
-    if not mac or mac_aleatorio(mac):
-        return None
-    hexa = mac.replace("-", "")
-    tabela = carregar_fabricantes()
-    # O IEEE tambem vende blocos menores (prefixos de 7 e 9 digitos) dentro de um OUI,
-    # entao o prefixo mais longo e procurado primeiro.
-    for tamanho in (9, 7, 6):
-        nome = tabela.get(hexa[:tamanho])
-        if nome:
-            return nome
-    return None
-
-
 def texto_tempo(tempo_ms: Optional[float]) -> str:
     """2.87 -> '3 ms';  0.4 -> '<1 ms';  None -> '-'."""
     if tempo_ms is None:
