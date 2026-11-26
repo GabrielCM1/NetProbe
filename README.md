@@ -37,8 +37,8 @@ Trabalho final da disciplina de **Redes de Computadores**, Projeto 2.
 
 - **Python 3.9 ou mais novo**
 - **Windows** ou **Linux**
-- **Nenhuma biblioteca externa.** Só a biblioteca padrão do Python é usada (`socket`, `subprocess`, `ctypes`, `tkinter`, `threading`).
-- **Não precisa de administrador nem de root.**
+- **Varredura e inventário:** nenhuma biblioteca externa. Só a biblioteca padrão do Python é usada (`socket`, `subprocess`, `ctypes`, `tkinter`, `threading`).
+- **Varredura e inventário:** podem rodar como usuário comum. O modo opcional Monitor local tem requisitos próprios, descritos abaixo.
 
 Para baixar o projeto:
 
@@ -47,7 +47,7 @@ git clone https://github.com/GabrielCM1/NetProbe.git
 cd NetProbe
 ```
 
-**Windows:** o Tkinter já vem com o instalador oficial do Python. Não precisa de mais nada.
+**Windows:** o Tkinter já vem com o instalador oficial do Python.
 
 **Linux:** algumas distribuições separam o Tkinter num pacote próprio. Se `python3 app.py` reclamar de `tkinter`, instale:
 
@@ -61,6 +61,35 @@ sudo apt install python3-tk           # Ubuntu / Debian
 ---
 
 ## 2. Como usar
+
+### Monitor local no servidor B (escopo 4.2)
+
+Na branch `monitor-local`, execute no computador B, com o mesmo Python que abre o NetProbe:
+
+```bash
+python -m pip install -r requirements-monitor.txt
+python app.py
+```
+
+Use um ambiente virtual se a distribuição gerenciar o Python do sistema. No Windows, instale também o [Npcap](https://npcap.com/#download). No Linux, a captura precisa de permissão para abrir um socket de pacotes (CAP_NET_RAW). Confirme essa permissão com o responsável pelo notebook antes do ensaio. A lista de conexões inclui os sockets que o sistema disponibiliza ao usuário do processo.
+
+**Se aparecer `No module named pip` no Linux**, instale as duas bibliotecas diretamente pelo gerenciador da distribuição. Use `cat /etc/os-release` para identificar o sistema. Em derivados de Fedora que usam OSTree, confira se `rpm-ostree status` mostra a implantação atual.
+
+| Sistema | Comando |
+|---|---|
+| Fedora Atomic com rpm-ostree | `rpm-ostree install --allow-inactive python3-psutil python3-scapy` e reinicie após a instalação |
+| Fedora tradicional | `sudo dnf install python3-psutil python3-scapy` |
+| Debian ou Ubuntu | `sudo apt install python3-psutil python3-scapy` |
+
+Com os pacotes do sistema, confira o carregamento com `/usr/bin/python3 -c "import psutil, scapy; print('OK')"` e abra com `/usr/bin/python3 app.py`.
+
+1. Conecte A e B à mesma rede. Em B, abra **Monitor local**, selecione a interface com o IPv4 de B, informe o IPv4 de A e clique em **Iniciar**. Aguarde a indicação de captura ativa.
+2. Para demonstrar a porta em **LISTENING**, use um serviço de teste em B. Com o iperf3 instalado nos dois computadores, execute `iperf3 -s -4` em B. A porta padrão é 5201. No inventário de A, um intervalo de portas que inclua 5201 permite conferir também a acessibilidade pela rede.
+3. Em A, execute `iperf3 -c IP_DE_B -t 15 -b 1M`, substituindo `IP_DE_B` pelo endereço de B. Durante a transferência, mostre **ESTABLISHED**, as portas, o IP de A, a taxa em pacotes/s e o volume TCP.
+4. Em A, execute `iperf3 -c IP_DE_B -u -b 1M -t 15`. Agora cresce o volume **UDP**. O iperf3 também usa uma conexão TCP de controle.
+5. Ao terminar, observe a taxa voltar a zero quando cessa o tráfego. **Parar** conserva o resultado na tela; **Iniciar** zera os contadores para uma nova medição. Encerre o iperf3 em B com Ctrl+C.
+
+A captura contabiliza somente pacotes IPv4 TCP e UDP com origem A e destino B na interface escolhida. O volume soma o tamanho IPv4 observado, incluindo cabeçalhos e retransmissões (KB = 1.000 bytes, MB = 1.000.000). Assim, o valor pode diferir dos bytes de dados da aplicação. A taxa usa a variação do número de pacotes por segundo. Tráfego acima da capacidade de captura pode sofrer perdas. Portas em escuta são listadas tanto para o IP de B como para todos os endereços locais (`0.0.0.0`); as conexões estabelecidas são filtradas pelo par A/B.
 
 ### 2.1. Interface gráfica
 

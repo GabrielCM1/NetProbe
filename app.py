@@ -55,6 +55,9 @@ from concurrent.futures import ThreadPoolExecutor   # portas de vários aparelho
 from tkinter import filedialog, messagebox, ttk     # janela "Salvar como", avisos e widgets
 
 import scanner                 # toda a parte de rede (o outro arquivo)
+# Janela extra "Monitor local" (escopo 4.2): portas LISTENING/ESTABLISHED e captura
+# de pacotes ao vivo. Fica em outro arquivo porque precisa de psutil e scapy.
+from monitor_local import abrir_monitor
 
 # Fontes comuns em cada sistema (se faltar alguma, o Tk usa a padrão)
 FONTE = ("Segoe UI", 10) if scanner.WINDOWS else ("DejaVu Sans", 10)
@@ -148,6 +151,9 @@ class NetProbeApp:
         self.bt_parar = ttk.Button(botoes, text="Parar", command=self.parar, state="disabled")
         self.bt_parar.pack(fill="x", pady=2)
         ttk.Button(botoes, text="Limpar tabela", command=self.limpar).pack(fill="x", pady=2)
+        # Abre a janela do Monitor local (monitor_local.py). O lambda adia a chamada:
+        # abrir_monitor só roda quando o botão é clicado, e não ao montar a tela.
+        ttk.Button(botoes, text="Monitor local", command=lambda: abrir_monitor(self.janela)).pack(fill="x", pady=2)
         ttk.Button(botoes, text="Exportar CSV", command=self.exportar).pack(fill="x", pady=2)
 
         # --- barra de progresso e resumo (Online / só por ARP / Offline)
