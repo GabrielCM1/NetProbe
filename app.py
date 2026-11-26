@@ -35,7 +35,7 @@ class NetProbeApp:
     def __init__(self, janela: tk.Tk):
         self.janela = janela
         janela.title("NetProbe Wi-Fi")
-        janela.geometry("1360x720")
+        janela.geometry("1400x700")
         janela.minsize(900, 560)
 
         # Estado do programa
@@ -72,7 +72,7 @@ class NetProbeApp:
         self.var_porta_fim = tk.StringVar(value="1024")
         self.var_timeout_porta = tk.StringVar(value="300")
         self.var_monitorar = tk.BooleanVar(value=False)
-        self.var_intervalo = tk.StringVar(value="20")
+        self.var_intervalo = tk.StringVar(value="5")
 
         def campo(texto, var, coluna, linha, largura=8, valores=None):
             ttk.Label(cfg, text=texto).grid(row=linha, column=coluna, sticky="w", padx=(0, 4), pady=3)
@@ -120,11 +120,11 @@ class NetProbeApp:
         # --- tabela de dispositivos
         tab = ttk.Frame(self.janela, padding=(10, 6))
         tab.pack(fill="both", expand=True)
-        colunas = [("ip", "IP", 110), ("nome", "Nome", 130), ("tipo", "Tipo provável", 210),
-                   ("fabricante", "Fabricante", 150), ("mac", "MAC", 140), ("status", "Status", 65),
-                   ("metodo", "Descoberto por", 140), ("tempo", "Resposta", 70),
-                   ("portas", "Portas abertas", 220), ("visto", "Visto por último", 105),
-                   ("obs", "Observações", 220)]
+        colunas = [("ip", "IP", 110), ("mac", "MAC", 140), ("fabricante", "Fabricante", 150),
+                   ("status", "Status", 65), ("metodo", "Descoberto por", 140),
+                   ("tempo", "Resposta", 70), ("ttl", "TTL (sistema)", 170),
+                   ("portas", "Portas abertas", 230), ("visto", "Visto por último", 105),
+                   ("obs", "Observações", 200)]
         self.colunas = colunas
         self.tabela = ttk.Treeview(tab, columns=[c[0] for c in colunas], show="headings")
         for chave, titulo, largura in colunas:
@@ -339,8 +339,9 @@ class NetProbeApp:
                     self.lbl_progresso.configure(text="Verificando IPs: %d de %d" % (self.feitos, self.total))
                     if msg[2]:
                         self._host_encontrado(msg[2])
+                    else:
+                        self._registrar_falta(msg[1])
                 elif tipo == "varredura_ok":
-                    self._marcar_offline(set(msg[1]))
                     self._redesenhar_tudo()       # atualiza as observacoes (ex.: MAC repetido)
                     self.log("Varredura concluída em %.1f s: %d dispositivo(s) online" % (msg[2], len(msg[1])))
                     self.lbl_progresso.configure(text="Verificando portas...")
@@ -400,7 +401,7 @@ class NetProbeApp:
             anterior = self.hosts[h.ip]
             h.portas = anterior.portas           # mantem as portas ja descobertas
             h.mac = h.mac or anterior.mac        # se o ARP falhou agora, mantem o MAC anterior
-            h.ttl = h.ttl or anterior.ttl        # rodada por ARP nao tem TTL
+            h.ttl = h.ttl or anterior.ttl        # rodada achada so por ARP nao tem TTL
             if anterior.mac and h.mac != anterior.mac:
                 self._mac_mudou(h.ip, anterior.mac, h.mac, estava_offline=(antes == "offline"))
             else:                                # mesmo aparelho: mantem o que ja foi descoberto
@@ -450,22 +451,18 @@ class NetProbeApp:
             self.log("ALERTA: possível COLISÃO DE IP em %s: MAC %s -> %s. Dois aparelhos com o "
                      "mesmo IP, ou ARP spoofing." % (ip, mac_antigo, mac_novo))
 
-    def _marcar_offline(self, online_agora: set):
-        """Quem ja tinha aparecido e nao respondeu nesta rodada.
-        So vira OFFLINE depois de faltar em 2 rodadas seguidas: celulares em modo
-        economia as vezes deixam de responder uma vez, e a tela ficaria piscando."""
-        for ip in self.hosts:
-            if ip in online_agora or self.status.get(ip) == "offline":
-                continue
-            self.faltas[ip] = self.faltas.get(ip, 0) + 1
-            if self.faltas[ip] == 1:
-                self.log("%s não respondeu nesta rodada (será OFFLINE se faltar de novo)" % ip)
-            else:
-                self.status[ip] = "offline"
-                self.portas_feitas.discard(ip)    # quando voltar, verifica as portas de novo
-                self.log("%s ficou OFFLINE" % ip)
-                self._desenhar_linha(ip)
-        self._atualizar_resumo()
+    def _registrar_falta(self, ip: str):
+        """Conta uma falta assim que o ping e o ARP deste IP terminam sem resposta."""
+        if ip not in self.hosts or self.status.get(ip) == "offline":
+            return
+        self.faltas[ip] = self.faltas.get(ip, 0) + 1
+        if self.faltas[ip] == 1:
+            self.log("%s não respondeu nesta rodada (será OFFLINE se faltar de novo)" % ip)
+            return
+        self.status[ip] = "offline"
+        self.portas_feitas.discard(ip)
+        self.log("%s ficou OFFLINE" % ip)
+        self._desenhar_linha(ip)
 
     def _desenhar_linha(self, ip: str):
         h, st = self.hosts[ip], self.status[ip]
@@ -483,10 +480,9 @@ class NetProbeApp:
             portas = "-"
         else:
             portas = "aguardando..."
-        valores = (ip, h.nome or "-", scanner.palpite_tipo(h, self.gateway) or "-",
-                   scanner.texto_fabricante(h.mac),
-                   h.mac or "desconhecido", nome_status, metodo, tempo, portas,
-                   self.visto.get(ip, "-"), self._observacoes(ip))
+        ttl = "%d (%s)" % (h.ttl, scanner.palpite_sistema(h.ttl)) if h.ttl else "-"
+        valores = (ip, h.mac or "desconhecido", scanner.fabricante(h.mac) or "-", nome_status,
+                   metodo, tempo, ttl, portas, self.visto.get(ip, "-"), self._observacoes(ip))
         tag = "conflito" if ip in self.conflitos and st != "offline" else st
         if self.tabela.exists(ip):
             self.tabela.item(ip, values=valores, tags=(tag,))

@@ -68,6 +68,30 @@ class TestMac(unittest.TestCase):
         self.assertFalse(scanner.mac_aleatorio(None))
 
 
+class TestTtlEFabricante(unittest.TestCase):
+    def test_ttl_windows_e_linux(self):
+        self.assertEqual(scanner.interpretar_ttl("Resposta de 192.168.15.1: bytes=32 tempo=4ms TTL=128"), 128)
+        self.assertEqual(scanner.interpretar_ttl("64 bytes from 192.168.1.1: icmp_seq=1 ttl=64 time=2.87 ms"), 64)
+        self.assertIsNone(scanner.interpretar_ttl("Esgotado o tempo limite do pedido."))
+
+    def test_palpite_sistema(self):
+        self.assertEqual(scanner.palpite_sistema(64), "Linux/Android/Apple")
+        self.assertEqual(scanner.palpite_sistema(127), "Windows")
+        self.assertEqual(scanner.palpite_sistema(255), "equipamento de rede")
+        self.assertEqual(scanner.palpite_sistema(None), "")
+
+    def test_fabricante(self):
+        tabela = {"F4E84F": "ZTE", "70B3D5": "IEEE Registration Authority", "70B3D5123": "Empresa Pequena"}
+        with mock.patch.object(scanner, "carregar_fabricantes", return_value=tabela):
+            self.assertEqual(scanner.fabricante("F4-E8-4F-98-1B-94"), "ZTE")
+            self.assertEqual(scanner.fabricante("70-B3-D5-12-34-56"), "Empresa Pequena")  # prefixo mais longo ganha
+            self.assertIsNone(scanner.fabricante("6A-25-C6-23-AF-B0"))   # MAC aleatorio
+            self.assertIsNone(scanner.fabricante(None))
+
+    def test_arquivo_de_fabricantes_real(self):
+        self.assertEqual(scanner.fabricante("F4-E8-4F-98-1B-94"), "ZTE")
+
+
 class TestTabelaArp(unittest.TestCase):
     ARP_WINDOWS = (
         "\r\nInterface: 192.168.15.6 --- 0xb\r\n"
@@ -118,11 +142,11 @@ class TestVerificarIp(unittest.TestCase):
     """A logica 'ping primeiro, ARP se o ping falhar', sem tocar na rede."""
 
     def test_respondeu_ping(self):
-        with mock.patch.object(scanner, "fazer_ping", return_value=(3.0, 64)), \
+        with mock.patch.object(scanner, "fazer_ping", return_value=(3.0, 128)), \
              mock.patch.object(scanner, "sondar_arp", return_value="AA-BB-CC-DD-EE-01"), \
              mock.patch.object(scanner, "mac_da_tabela_arp", return_value="AA-BB-CC-DD-EE-01"):
             h = scanner.verificar_ip("10.0.0.5", 500, [])
-        self.assertEqual((h.metodo, h.mac, h.tempo_ms, h.ttl), ("PING", "AA-BB-CC-DD-EE-01", 3.0, 64))
+        self.assertEqual((h.metodo, h.mac, h.tempo_ms, h.ttl), ("PING", "AA-BB-CC-DD-EE-01", 3.0, 128))
 
     def test_bloqueia_ping_mas_responde_arp(self):
         with mock.patch.object(scanner, "fazer_ping", return_value=None), \

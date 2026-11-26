@@ -55,15 +55,6 @@ class Host:
     este_pc: bool = False       # True se for o proprio computador que esta varrendo
     portas: List[int] = field(default_factory=list)
     ttl: Optional[int] = None   # TTL da resposta do ping (da uma pista do sistema operacional)
-    nome: Optional[str] = None  # nome que o aparelho anuncia (mDNS, NetBIOS ou DNS)
-    servicos: Set[str] = field(default_factory=set)   # servicos anunciados por mDNS, ex.: '_airplay'
-    modelo: Optional[str] = None                      # modelo anunciado por mDNS, ex.: 'iPhone14,5'
-    portas_extras: List[int] = field(default_factory=list)  # portas de identificacao abertas
-
-    @property
-    def fabricante(self) -> Optional[str]:
-        """Fabricante da placa de rede, pelos 3 primeiros bytes do MAC."""
-        return fabricante(self.mac)
 
 
 # --------------------------------------------------------------------------
@@ -198,9 +189,22 @@ def interpretar_ping(saida: Optional[str]) -> Optional[float]:
 
 
 def interpretar_ttl(saida: Optional[str]) -> Optional[int]:
-    """'... TTL=128' ou '... ttl=64 ...' -> 128 / 64."""
+    """'... TTL=128' (Windows) ou '... ttl=64 ...' (Linux) -> 128 / 64."""
     m = re.search(r"TTL=(\d+)", saida or "", re.I)
     return int(m.group(1)) if m else None
+
+
+def palpite_sistema(ttl: Optional[int]) -> str:
+    """Cada sistema comeca o TTL num valor: 64 (Linux, Android, iPhone, Mac),
+    128 (Windows) ou 255 (roteadores e equipamentos de rede). Cada roteador no
+    caminho tira 1, mas numa rede local o valor chega quase igual ao inicial."""
+    if not ttl:
+        return ""
+    if ttl > 128:
+        return "equipamento de rede"
+    if ttl > 64:
+        return "Windows"
+    return "Linux/Android/Apple"
 
 
 def fazer_ping(ip: str, timeout_ms: int) -> Optional[Tuple[float, Optional[int]]]:
@@ -463,6 +467,49 @@ def nome_porta(p: int) -> str:
     """'80' -> '80 (HTTP)'."""
     nome = SERVICOS.get(p)
     return "%d (%s)" % (p, nome) if nome else str(p)
+
+
+# --------------------------------------------------------------------------
+# Fabricante pelo MAC
+# --------------------------------------------------------------------------
+# Os 3 primeiros bytes do MAC (o "OUI") sao comprados pelo fabricante e registrados
+# publicamente pelo IEEE. Ex.: F4-E8-4F-... = ZTE. A lista fica em fabricantes.txt
+# (copia do registro do IEEE mantida pelo Wireshark). O programa nao acessa a internet.
+ARQUIVO_FABRICANTES = Path(__file__).resolve().parent / "fabricantes.txt"
+_fabricantes: Optional[Dict[str, str]] = None
+
+
+def carregar_fabricantes() -> Dict[str, str]:
+    """Le o fabricantes.txt so na 1a vez: {'F4E84F': 'ZTE', ...}. Sem o arquivo, fica vazio."""
+    global _fabricantes
+    if _fabricantes is None:
+        tabela = {}
+        try:
+            with open(ARQUIVO_FABRICANTES, encoding="utf-8") as f:
+                for linha in f:
+                    prefixo, _, nome = linha.rstrip("\n").partition("\t")
+                    if nome and not linha.startswith("#"):
+                        tabela[prefixo] = nome
+        except OSError:
+            pass
+        _fabricantes = tabela
+    return _fabricantes
+
+
+def fabricante(mac: Optional[str]) -> Optional[str]:
+    """'F4-E8-4F-98-1B-94' -> 'ZTE'. None se nao souber.
+    MAC aleatorio nao tem fabricante: foi inventado pelo aparelho, por privacidade."""
+    if not mac or mac_aleatorio(mac):
+        return None
+    hexa = mac.replace("-", "")
+    tabela = carregar_fabricantes()
+    # O IEEE tambem vende blocos menores (prefixos de 7 e 9 digitos) dentro de um OUI,
+    # entao o prefixo mais longo e procurado primeiro.
+    for tamanho in (9, 7, 6):
+        nome = tabela.get(hexa[:tamanho])
+        if nome:
+            return nome
+    return None
 
 
 def texto_tempo(tempo_ms: Optional[float]) -> str:
@@ -973,10 +1020,6 @@ if __name__ == "__main__":
                 aplicar_mdns(h, servicos[h.ip])
         print("  %-15s %-17s %-4s %6s  portas: %s" % (
             h.ip, h.mac or "?", h.metodo, texto_tempo(h.tempo_ms),
-            ", ".join(nome_porta(p) for p in h.portas) or "nenhuma"))
-        print("  %15s fabricante: %s | nome: %s | tipo provável: %s" % (
-            "", texto_fabricante(h.mac), h.nome or "-", palpite_tipo(h, gateway) or "?"))
-        if h.servicos or h.modelo or h.portas_extras:
-            print("  %15s mDNS: %s | modelo: %s | portas de identificação: %s" % (
-                "", ", ".join(sorted(h.servicos)) or "-", h.modelo or "-",
-                ", ".join(nome_porta(p) for p in h.portas_extras) or "-"))
+            ", ".join(nome_porta(p) for p in h.portas) or "nenhuma", extra))
+        print("  %15s fabricante: %s | TTL: %s %s" % (
+            "", fabricante(h.mac) or "-", h.ttl or "-", palpite_sistema(h.ttl)))

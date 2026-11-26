@@ -29,6 +29,8 @@ class TestInterface(unittest.TestCase):
     def rodada(self, hosts):
         """Simula uma rodada completa da varredura com estes hosts online."""
         self.app.fila.put(("inicio", 254, "10.0.0.0/24"))
+        for ip in self.app.hosts.keys() - {h.ip for h in hosts}:
+            self.app.fila.put(("ip", ip, None))
         for h in hosts:
             self.app.fila.put(("ip", h.ip, h))
         self.app.fila.put(("varredura_ok", [h.ip for h in hosts], 1.0))
@@ -53,7 +55,9 @@ class TestInterface(unittest.TestCase):
         self.rodada([h])
         self.rodada([])
         self.assertEqual(self.linha("10.0.0.1")["tag"], "online")    # 1 falta: tolera
-        self.rodada([])
+        # O resultado do IP chega antes do fim da segunda varredura.
+        self.app.fila.put(("ip", h.ip, None))
+        self.app._processar_fila()
         self.assertEqual(self.linha("10.0.0.1")["tag"], "offline")   # 2 faltas: offline
         self.rodada([scanner.Host("10.0.0.1", "00-11-22-33-44-01", "PING", 2)])
         self.assertEqual(self.linha("10.0.0.1")["tag"], "online")    # voltou
