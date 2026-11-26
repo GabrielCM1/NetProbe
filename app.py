@@ -4,6 +4,7 @@ NetProbe Wi-Fi - INTERFACE (janela).
 Abre uma janela com:
   - campos para escolher a rede, os timeouts e o intervalo de portas;
   - uma tabela que vai se preenchendo em TEMPO REAL com IP, MAC, status e portas;
+  - identificacao de cada aparelho: nome, fabricante e tipo provavel;
   - modo "monitorar", que repete a varredura sozinho e marca quem saiu da rede como OFFLINE;
   - alerta de COLISAO DE IP quando o MAC de um IP muda entre uma rodada e outra;
   - exportacao da tabela IP/MAC para CSV.
@@ -14,7 +15,7 @@ Para rodar:  python app.py
 # ==========================================================================
 # MAPA DESTE ARQUIVO (versão comentada, para estudo)
 # ==========================================================================
-# O programa tem DUAS threads trabalhando ao mesmo tempo:
+# A tela e a varredura trabalham em paralelo. A varredura também usa threads auxiliares:
 #
 #   THREAD DA TELA (principal)              THREAD DE VARREDURA (_trabalho)
 #   -------------------------               -------------------------------
@@ -29,12 +30,14 @@ Para rodar:  python app.py
 #                                             fila.put("fim")
 #   _processar_fila()  <--- lê a fila a cada 100 ms ---
 #     "ip"           -> _host_encontrado() -> _desenhar_linha()
-#     "varredura_ok" -> _marcar_offline()  (quem sumiu)
+#     "ip" sem resposta -> _registrar_falta() -> offline na segunda falta seguida
+#     "varredura_ok" -> resume a rodada e atualiza as observações
+#     "nome" e "mdns" -> atualizam a identificação do aparelho
 #     "portas"       -> escreve as portas na linha
 #     "fim"          -> _terminou() -> se "Monitorar": agenda a próxima rodada
 #
 # Por que duas threads e uma fila? O Tkinter só aceita ser mexido pela thread que
-# criou a janela. Se a varredura (que leva ~10 s) rodasse na thread da tela, a
+# criou a janela. Se a varredura rodasse na thread da tela, a
 # janela congelaria. Então a varredura roda em outra thread e só MANDA RECADOS
 # pela fila; quem mexe na tela é sempre a thread principal.
 #
@@ -74,15 +77,16 @@ class NetProbeApp:
         # Os dicionários usam o IP como chave.
         self.hosts = {}            # ip -> scanner.Host (todos que já apareceram)
         self.status = {}           # ip -> "online" | "arp" | "offline"
-        self.visto = {}            # ip -> hora em que foi visto pela última vez
-        self.faltas = {}           # ip -> quantas rodadas seguidas ele não apareceu
-        self.conflitos = {}        # ip -> MAC antigo, quando o MAC do IP mudou (colisão de IP)
-        self.portas_feitas = set() # ips que já tiveram as portas verificadas
-        self.fila = queue.Queue()  # recados da thread de varredura para a tela
-        self.parar_evento = threading.Event()   # "bandeira": levantada quando clicam em Parar
-        self.rodando = False       # True enquanto uma rodada está em andamento
-        self.proxima_rodada = None # agendamento do modo monitorar (para poder cancelar)
-        self.rodada = 0            # contador de rodadas, só para o log
+        self.visto = {}            # ip -> hora em que foi visto pela ultima vez
+        self.faltas = {}           # ip -> quantas rodadas seguidas ele nao apareceu
+        self.conflitos = {}        # ip -> MAC antigo, quando o MAC do IP mudou (colisao de IP)
+        self.portas_feitas = set() # ips que ja tiveram as portas verificadas
+        self.fila = queue.Queue()  # mensagens da thread de varredura para a tela
+        self.parar_evento = threading.Event()
+        self.rodando = False
+        self.proxima_rodada = None # agendamento do modo monitorar
+        self.rodada = 0
+        self.gateway = None        # IP do roteador, para o palpite do tipo de aparelho
 
         # Passo 3: desenha a janela e começa a "escutar" a fila (a cada 100 ms, para sempre).
         self._montar_tela()
@@ -110,7 +114,7 @@ class NetProbeApp:
         self.var_porta_fim = tk.StringVar(value="1024")
         self.var_timeout_porta = tk.StringVar(value="300")
         self.var_monitorar = tk.BooleanVar(value=False)
-        self.var_intervalo = tk.StringVar(value="20")
+        self.var_intervalo = tk.StringVar(value="5")
 
         # Função auxiliar: cria um rótulo + campo numa posição da grade (linha, coluna).
         # Se receber "valores", vira uma lista suspensa (Combobox) em vez de campo simples.
@@ -164,25 +168,28 @@ class NetProbeApp:
         # Cada coluna: (nome interno, título na tela, largura em pixels).
         # A ordem aqui é a mesma ordem dos valores montados em _desenhar_linha().
         colunas = [("ip", "IP", 110), ("mac", "MAC", 140), ("fabricante", "Fabricante", 150),
+                   ("nome", "Nome", 150), ("tipo", "Tipo provável", 160),
                    ("status", "Status", 65), ("metodo", "Descoberto por", 140),
-                   ("tempo", "Resposta", 70), ("ttl", "TTL (sistema)", 170),
+                   ("tempo", "Resposta", 70), ("ttl", "Último TTL (sistema provável)", 210),
                    ("portas", "Portas abertas", 230), ("visto", "Visto por último", 105),
                    ("obs", "Observações", 200)]
         self.colunas = colunas
         self.tabela = ttk.Treeview(tab, columns=[c[0] for c in colunas], show="headings")
         for chave, titulo, largura in colunas:
             self.tabela.heading(chave, text=titulo)
-            self.tabela.column(chave, width=largura, anchor="w", stretch=chave in ("portas", "obs"))
-        # "Tags" = estilos de linha. Cada linha recebe uma tag conforme o status,
-        # e a tag define a cor de fundo.
+            self.tabela.column(chave, width=largura, minwidth=50, anchor="w", stretch=False)
         self.tabela.tag_configure("online", background="#dcfce7")    # verde
         self.tabela.tag_configure("arp", background="#fef9c3")       # amarelo
         self.tabela.tag_configure("offline", background="#fee2e2", foreground="#7f1d1d")  # vermelho
         self.tabela.tag_configure("conflito", background="#fed7aa", foreground="#7c2d12")  # laranja
         rolagem = ttk.Scrollbar(tab, orient="vertical", command=self.tabela.yview)
-        self.tabela.configure(yscrollcommand=rolagem.set)
-        self.tabela.pack(side="left", fill="both", expand=True)
-        rolagem.pack(side="right", fill="y")
+        rolagem_x = ttk.Scrollbar(tab, orient="horizontal", command=self.tabela.xview)
+        self.tabela.configure(yscrollcommand=rolagem.set, xscrollcommand=rolagem_x.set)
+        self.tabela.grid(row=0, column=0, sticky="nsew")
+        rolagem.grid(row=0, column=1, sticky="ns")
+        rolagem_x.grid(row=1, column=0, sticky="ew")
+        tab.rowconfigure(0, weight=1)
+        tab.columnconfigure(0, weight=1)
 
         # --- legenda das cores
         legenda = ttk.Frame(self.janela, padding=(10, 0))
@@ -248,7 +255,7 @@ class NetProbeApp:
             return
         # Passo 3: varredura manual = verificar as portas de todo mundo de novo.
         self.portas_feitas.clear()   # varredura manual: verifica as portas de todos de novo
-        # Passo 4: começa a rodada.
+        self.gateway = scanner.gateway_padrao()
         self._iniciar_rodada()
 
     def _iniciar_rodada(self):
@@ -325,9 +332,7 @@ class NetProbeApp:
         # IMPORTANTE: daqui para baixo NADA mexe na janela. Tudo vira um recado na fila
         # (self.fila.put(...)), que a thread da tela aplica em _processar_fila().
         try:
-            # Passo 1: avisa quantos IPs serão testados (para a barra de progresso).
-            # Uma /24 tem 256 endereços; tirando o da rede e o de broadcast, 254.
-            total = p["rede"].num_addresses - 2 if p["rede"].prefixlen < 31 else p["rede"].num_addresses
+            total = sum(1 for _ in p["rede"].hosts())   # IPs testaveis (sem rede e broadcast)
             self.fila.put(("inicio", total, str(p["rede"])))
             t0 = time.time()
             # Passo 2: PING + ARP em todos os IPs (scanner.varrer_rede).
@@ -341,31 +346,49 @@ class NetProbeApp:
             if self.parar_evento.is_set():
                 self.fila.put(("fim", True)); return
             # Passo 4: avisa que o ping+ARP acabou, com a lista de quem está online.
-            # A tela usa isso para descobrir quem SUMIU (offline).
+            # A tela usa a lista para informar quantos aparelhos responderam.
             self.fila.put(("varredura_ok", [h.ip for h in achados], time.time() - t0))
 
-            # Portas: só de quem está online e ainda não foi verificado.
-            # Vários aparelhos ao mesmo tempo, para não esperar um terminar para começar o outro.
-            # Passo 5: separa quem ainda precisa ter as portas testadas.
-            # (No modo Monitorar, quem já foi testado é pulado, para a rodada ser rápida.)
+            # Portas e nome: so de quem esta online e ainda nao foi verificado.
+            # Varios aparelhos ao mesmo tempo, para nao esperar um terminar para comecar o outro.
             ja_feitos = set(self.portas_feitas)
             pendentes = [h for h in achados if h.ip not in ja_feitos]
 
-            # O que fazer com cada aparelho: avisa que começou, testa as portas
-            # (scanner.escanear_portas) e manda o resultado pela fila.
+            def nome_de(h):
+                if self.parar_evento.is_set() or h.este_pc:
+                    return
+                nome = scanner.descobrir_nome(h.ip)
+                if nome and not self.parar_evento.is_set():
+                    self.fila.put(("nome", h.ip, nome))
+
             def portas_de(h):
                 if self.parar_evento.is_set():
                     return
                 self.fila.put(("portas_inicio", h.ip))
                 portas = scanner.escanear_portas(h.ip, p["porta_ini"], p["porta_fim"],
                                                  p["timeout_porta"], parar=self.parar_evento.is_set)
+                # Portas que entregam o tipo de aparelho (ex.: 62078 = iPhone), fora do intervalo
+                extras = scanner.escanear_portas_identificacao(
+                    h.ip, p["porta_ini"], p["porta_fim"], p["timeout_porta"], parar=self.parar_evento.is_set)
                 if not self.parar_evento.is_set():
-                    self.fila.put(("portas", h.ip, portas))
+                    self.fila.put(("portas", h.ip, portas, extras))
 
-            # Passo 6: roda portas_de() para 3 aparelhos ao mesmo tempo.
-            with ThreadPoolExecutor(max_workers=HOSTS_EM_PARALELO) as pool:
-                list(pool.map(portas_de, pendentes))     # list() repassa erros das threads
-            # Passo 7: avisa que a rodada acabou (e se foi interrompida ou não).
+            def servicos_mdns():
+                # Uma pergunta para a REDE INTEIRA por rodada (pega iPhones, Macs, TVs...)
+                resultado = scanner.descobrir_servicos_mdns(parar=self.parar_evento.is_set)
+                if not self.parar_evento.is_set():
+                    self.fila.put(("mdns", resultado))
+
+            # Os nomes sao perguntados ao mesmo tempo que as portas sao testadas
+            nomes = ThreadPoolExecutor(max_workers=16)
+            try:
+                nomes.submit(servicos_mdns)
+                for h in pendentes:
+                    nomes.submit(nome_de, h)
+                with ThreadPoolExecutor(max_workers=HOSTS_EM_PARALELO) as pool:
+                    list(pool.map(portas_de, pendentes))     # list() repassa erros das threads
+            finally:
+                nomes.shutdown(wait=not self.parar_evento.is_set(), cancel_futures=True)
             self.fila.put(("fim", self.parar_evento.is_set()))
         except Exception as e:  # nunca deixa a janela "presa" em rodando
             # Qualquer erro inesperado vira um recado, para a tela mostrar e destravar.
@@ -373,15 +396,20 @@ class NetProbeApp:
 
     # ------------------------------------------------------------------ fila -> tela
     def _processar_fila(self):
-        """Roda a cada 100 ms na thread da tela e aplica as mensagens da varredura."""
-        # Recados possíveis (o 1º item diz o tipo):
-        #   ("inicio", total, rede)          começou uma rodada
-        #   ("ip", ip, host ou None)         terminou um IP (None = IP vazio)
-        #   ("varredura_ok", ips, segundos)  acabou o ping+ARP de todos
-        #   ("portas_inicio", ip)            começou o teste de portas deste IP
-        #   ("portas", ip, [portas])         acabou o teste de portas deste IP
-        #   ("fim", parado)                  acabou a rodada
-        #   ("erro", texto)                  deu erro inesperado na thread
+        """Roda a cada 100 ms na thread da tela e aplica as mensagens da varredura.
+
+        Por que uma fila? O Tkinter so aceita ser mexido pela thread que criou a janela.
+        A thread de varredura entao so ENVIA mensagens, e esta funcao as aplica na tela.
+        Mensagens (sempre uma tupla, o 1o item diz o tipo):
+          ("inicio", total, rede)        comecou uma rodada
+          ("ip", ip, host ou None)       terminou um IP (None = vazio)
+          ("varredura_ok", ips, segundos) terminou o ping+ARP de todos
+          ("portas_inicio", ip)          comecou o teste de portas deste IP
+          ("portas", ip, [portas], [extras]) terminou o teste de portas (extras = de identificacao)
+          ("nome", ip, nome)             o aparelho disse o proprio nome
+          ("mdns", {ip: InfoMdns})       servicos/nome/modelo anunciados na rede inteira
+          ("fim", parado)                acabou a rodada (parado = clicaram em Parar)
+          ("erro", texto)                deu erro inesperado na thread"""
         try:
             # Passo 1: pega TODOS os recados que chegaram desde a última vez.
             # get_nowait() não espera: se a fila estiver vazia, gera queue.Empty
@@ -401,10 +429,10 @@ class NetProbeApp:
                     self.lbl_progresso.configure(text="Verificando IPs: %d de %d" % (self.feitos, self.total))
                     if msg[2]:
                         self._host_encontrado(msg[2])
+                    else:
+                        self._registrar_falta(msg[1])
                 elif tipo == "varredura_ok":
-                    # Confere quem sumiu e redesenha as observações de todos.
-                    self._marcar_offline(set(msg[1]))
-                    self._redesenhar_tudo()       # atualiza as observações (ex.: MAC repetido)
+                    self._redesenhar_tudo()       # atualiza as observacoes (ex.: MAC repetido)
                     self.log("Varredura concluída em %.1f s: %d dispositivo(s) online" % (msg[2], len(msg[1])))
                     self.lbl_progresso.configure(text="Verificando portas...")
                 elif tipo == "portas_inicio":
@@ -414,10 +442,19 @@ class NetProbeApp:
                     # Guarda as portas no Host e escreve na coluna.
                     ip, portas = msg[1], msg[2]
                     self.hosts[ip].portas = portas
+                    self.hosts[ip].portas_extras = msg[3]
                     self.portas_feitas.add(ip)
-                    self._set_coluna(ip, "portas", self._texto_portas(portas))
+                    self._desenhar_linha(ip)      # as portas tambem mudam o "tipo provavel"
                     if portas:
                         self.log("%s: portas abertas %s" % (ip, ", ".join(map(str, portas))))
+                elif tipo == "nome":
+                    ip, nome = msg[1], msg[2]
+                    if not self.hosts[ip].nome:          # o nome amigavel do mDNS tem preferencia
+                        self.hosts[ip].nome = nome
+                        self.log("%s se identificou como \"%s\"" % (ip, nome))
+                        self._desenhar_linha(ip)
+                elif tipo == "mdns":
+                    self._servicos_mdns(msg[1])
                 elif tipo == "fim":
                     self._terminou(parado=msg[1])
                 elif tipo == "erro":
@@ -454,21 +491,23 @@ class NetProbeApp:
 
     # ------------------------------------------------------------------ tabela
     def _host_encontrado(self, h: scanner.Host):
-        # Chamado para cada aparelho que respondeu (ping ou ARP) nesta rodada.
-        # A cada rodada chega um Host NOVO para o mesmo IP; aqui juntamos com o que
-        # já sabíamos dele.
-        novo = h.ip not in self.hosts            # é a primeira vez que vemos este IP?
-        antes = self.status.get(h.ip)            # status na rodada anterior
+        # A cada rodada chega um Host NOVO para o mesmo IP. Aqui juntamos com o que ja se
+        # sabia dele: o que a rodada atual nao trouxe (portas, MAC, TTL, nome) vem da anterior.
+        novo = h.ip not in self.hosts
+        antes = self.status.get(h.ip)
         if not novo:
             # Passo 1: completa com o que a rodada atual não trouxe.
             anterior = self.hosts[h.ip]
-            h.portas = anterior.portas           # mantém as portas já descobertas
-            h.mac = h.mac or anterior.mac        # se o ARP falhou agora, mantém o MAC anterior
-            h.ttl = h.ttl or anterior.ttl        # rodada achada só por ARP não tem TTL
-            # Passo 2: DETECÇÃO DE COLISÃO DE IP. O mesmo IP respondeu com OUTRO MAC?
+            h.portas = anterior.portas           # mantem as portas ja descobertas
+            h.mac = h.mac or anterior.mac        # se o ARP falhou agora, mantem o MAC anterior
             if anterior.mac and h.mac != anterior.mac:
                 self._mac_mudou(h.ip, anterior.mac, h.mac, estava_offline=(antes == "offline"))
-        # Passo 3: atualiza o estado: guarda o Host, o status, a hora e zera as faltas.
+            else:                                # mesmo aparelho: mantem o que ja foi descoberto
+                h.ttl = h.ttl or anterior.ttl
+                h.nome = h.nome or anterior.nome
+                h.servicos = h.servicos or anterior.servicos
+                h.modelo = h.modelo or anterior.modelo
+                h.portas_extras = h.portas_extras or anterior.portas_extras
         self.hosts[h.ip] = h
         self.status[h.ip] = "arp" if h.metodo == "ARP" else "online"
         self.visto[h.ip] = time.strftime("%H:%M:%S")
@@ -483,6 +522,20 @@ class NetProbeApp:
             self.log("%s voltou a ficar ONLINE" % h.ip)
         # Passo 5: desenha (ou redesenha) a linha deste IP na tabela.
         self._desenhar_linha(h.ip)
+
+    def _servicos_mdns(self, resultado):
+        """Aplica o que cada aparelho anunciou por mDNS (servicos, nome amigavel, modelo)."""
+        for ip, info in resultado.items():
+            h = self.hosts.get(ip)
+            if h is None or h.este_pc or self.status.get(ip) == "offline":
+                continue
+            antes = (h.nome, h.modelo, set(h.servicos))
+            scanner.aplicar_mdns(h, info)
+            if (h.nome, h.modelo, h.servicos) != antes:
+                detalhes = [x for x in (h.nome and '"%s"' % h.nome, h.modelo and "modelo " + h.modelo) if x]
+                self.log("%s anunciou por mDNS: %s" % (
+                    ip, ", ".join(detalhes + [", ".join(sorted(h.servicos))])))
+                self._desenhar_linha(ip)
 
     def _mac_mudou(self, ip, mac_antigo, mac_novo, estava_offline):
         """Deteccao de COLISAO DE IP: o mesmo IP respondeu com outro MAC.
@@ -501,27 +554,18 @@ class NetProbeApp:
             self.log("ALERTA: possível COLISÃO DE IP em %s: MAC %s -> %s. Dois aparelhos com o "
                      "mesmo IP, ou ARP spoofing." % (ip, mac_antigo, mac_novo))
 
-    def _marcar_offline(self, online_agora: set):
-        """Quem ja tinha aparecido e nao respondeu nesta rodada.
-        So vira OFFLINE depois de faltar em 2 rodadas seguidas: celulares em modo
-        economia as vezes deixam de responder uma vez, e a tela ficaria piscando."""
-        # Percorre TODOS os aparelhos que já apareceram alguma vez.
-        for ip in self.hosts:
-            # Respondeu nesta rodada, ou já está offline: nada a fazer.
-            if ip in online_agora or self.status.get(ip) == "offline":
-                continue
-            # Não respondeu: conta mais uma falta.
-            self.faltas[ip] = self.faltas.get(ip, 0) + 1
-            if self.faltas[ip] == 1:
-                # 1ª falta: só avisa (pode ser um celular "cochilando").
-                self.log("%s não respondeu nesta rodada (será OFFLINE se faltar de novo)" % ip)
-            else:
-                # 2ª falta seguida: agora sim, OFFLINE (linha vermelha).
-                self.status[ip] = "offline"
-                self.portas_feitas.discard(ip)    # quando voltar, verifica as portas de novo
-                self.log("%s ficou OFFLINE" % ip)
-                self._desenhar_linha(ip)
-        self._atualizar_resumo()
+    def _registrar_falta(self, ip: str):
+        """Conta uma falta assim que o ping e o ARP deste IP terminam sem resposta."""
+        if ip not in self.hosts or self.status.get(ip) == "offline":
+            return
+        self.faltas[ip] = self.faltas.get(ip, 0) + 1
+        if self.faltas[ip] == 1:
+            self.log("%s não respondeu nesta rodada (será OFFLINE se faltar de novo)" % ip)
+            return
+        self.status[ip] = "offline"
+        self.portas_feitas.discard(ip)
+        self.log("%s ficou OFFLINE" % ip)
+        self._desenhar_linha(ip)
 
     def _desenhar_linha(self, ip: str):
         # Monta o texto de cada coluna para este IP e põe na tabela.
@@ -541,9 +585,14 @@ class NetProbeApp:
             portas = "-"
         else:
             portas = "aguardando..."
-        ttl = "%d (%s)" % (h.ttl, scanner.palpite_sistema(h.ttl)) if h.ttl else "-"
-        # Passo 2: junta tudo na MESMA ordem das colunas definidas em _montar_tela().
-        valores = (ip, h.mac or "desconhecido", scanner.fabricante(h.mac) or "-", nome_status,
+        # Só o ping fornece TTL. Um aparelho visto por ARP pode ter uma medição anterior.
+        ttl = "Sem medição"
+        if h.ttl is not None:
+            ttl = "%d (%s)" % (h.ttl, scanner.palpite_sistema(h.ttl))
+        elif h.metodo == "ARP":
+            ttl = "Sem TTL (só ARP)"
+        valores = (ip, h.mac or "desconhecido", scanner.texto_fabricante(h.mac),
+                   h.nome or "-", scanner.palpite_tipo(h, self.gateway), nome_status,
                    metodo, tempo, ttl, portas, self.visto.get(ip, "-"), self._observacoes(ip))
         # Passo 3: escolhe a cor. Colisão (laranja) tem prioridade, exceto se está offline.
         tag = "conflito" if ip in self.conflitos and st != "offline" else st
@@ -573,9 +622,11 @@ class NetProbeApp:
                       if o != ip and x.mac == h.mac and self.status.get(o) != "offline"]
             if outros:
                 obs.append("mesmo MAC que " + ", ".join(sorted(outros, key=ipaddress.ip_address)))
-        # Aviso 3: MAC aleatório (celulares, por privacidade).
-        if scanner.mac_aleatorio(h.mac):
-            obs.append("MAC aleatório (privacidade)")
+        if h.modelo:
+            obs.append("modelo " + h.modelo)
+        if h.portas_extras:
+            # Portas fora do intervalo escolhido, testadas so para identificar o aparelho
+            obs.append("porta de identificação: " + ", ".join(scanner.nome_porta(p) for p in h.portas_extras))
         return "; ".join(obs)
 
     def _set_coluna(self, ip, coluna, valor):
