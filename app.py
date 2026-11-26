@@ -22,9 +22,9 @@ from tkinter import filedialog, messagebox, ttk
 
 import scanner
 
-# Fontes que existem em cada sistema (no Linux, as do proprio Tk)
-FONTE = ("Segoe UI", 10) if scanner.WINDOWS else ("TkDefaultFont", 10)
-FONTE_LOG = ("Consolas", 9) if scanner.WINDOWS else ("TkFixedFont", 9)
+# Fontes comuns em cada sistema (se faltar alguma, o Tk usa a padrao)
+FONTE = ("Segoe UI", 10) if scanner.WINDOWS else ("DejaVu Sans", 10)
+FONTE_LOG = ("Consolas", 9) if scanner.WINDOWS else ("DejaVu Sans Mono", 9)
 
 # Quantos aparelhos tem as portas verificadas ao mesmo tempo (cada um usa 200 conexoes)
 HOSTS_EM_PARALELO = 3

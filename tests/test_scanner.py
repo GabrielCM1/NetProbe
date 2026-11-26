@@ -1,6 +1,6 @@
 """Testes da parte de rede (scanner.py).
 
-Rodar:  python -m unittest -v
+Rodar (na pasta do projeto):  python -m unittest discover -s tests -v
 
 Os testes de interpretacao usam saidas reais dos comandos (Windows em portugues
 e ingles, Linux), entao funcionam em qualquer sistema, sem rede.

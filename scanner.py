@@ -271,25 +271,9 @@ def vizinhos_linux(max_idade: float = 0.25) -> Dict[str, Tuple[Optional[str], st
         lida_em, tabela = _vizinhos_cache
         if time.monotonic() - lida_em > max_idade:
             saida = _executar(["ip", "-4", "neigh", "show"], timeout=5)
-            tabela = ler_vizinhos_linux(saida) if saida is not None else _ler_proc_net_arp()
+            tabela = ler_vizinhos_linux(saida or "")
             _vizinhos_cache = (time.monotonic(), tabela)
         return tabela
-
-
-def _ler_proc_net_arp() -> Dict[str, Tuple[Optional[str], str]]:
-    """Plano B se o comando 'ip' nao existir: /proc/net/arp (flags 0x2 = MAC conhecido)."""
-    tabela = {}
-    try:
-        with open("/proc/net/arp") as f:
-            next(f)                                           # pula o cabecalho
-            for linha in f:
-                p = linha.split()
-                if len(p) >= 4:
-                    mac = normalizar_mac(p[3])
-                    tabela[p[0]] = (mac, "REACHABLE" if mac and p[2] == "0x2" else "INCOMPLETE")
-    except (OSError, StopIteration):
-        pass
-    return tabela
 
 
 def _provocar_arp(ip: str):
