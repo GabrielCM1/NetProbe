@@ -225,9 +225,19 @@ def abrir_monitor(parent):
     try:
         import psutil
         import scapy
-    except ImportError:
-        messagebox.showerror("Monitor local", "Instale as dependências do monitor com "
-                             "python -m pip install -r requirements-monitor.txt", parent=parent)
+    except ImportError as erro:
+        aviso = parent.children.get("dependencias_monitor")
+        if aviso is None:
+            aviso = tk.Toplevel(parent, name="dependencias_monitor")
+            aviso.title("Dependências do Monitor local")
+            texto = (f"O Monitor local precisa de psutil e scapy. Falha ao carregar: {erro}.\n\n"
+                     "Com pip: python -m pip install -r requirements-monitor.txt\n"
+                     "Sem pip no Linux: veja no README a instalação pelo sistema.\n"
+                     "Depois, reabra o NetProbe com o Python em que os pacotes foram instalados.")
+            ttk.Label(aviso, text=texto, wraplength=480, padding=12).pack()
+            ttk.Button(aviso, text="Fechar", command=aviso.destroy).pack(pady=(0, 10))
+        aviso.deiconify()
+        aviso.lift()
         return
     for janela in parent.winfo_children():
         if isinstance(janela, MonitorLocal):

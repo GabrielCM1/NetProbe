@@ -73,6 +73,16 @@ python app.py
 
 Use um ambiente virtual se a distribuição gerenciar o Python do sistema. No Windows, instale também o [Npcap](https://npcap.com/#download). No Linux, a captura precisa de permissão para abrir um socket de pacotes (CAP_NET_RAW). Confirme essa permissão com o responsável pelo notebook antes do ensaio. A lista de conexões inclui os sockets que o sistema disponibiliza ao usuário do processo.
 
+**Se aparecer `No module named pip` no Linux**, instale as duas bibliotecas diretamente pelo gerenciador da distribuição. Use `cat /etc/os-release` para identificar o sistema. Em derivados de Fedora que usam OSTree, confira se `rpm-ostree status` mostra a implantação atual.
+
+| Sistema | Comando |
+|---|---|
+| Fedora Atomic com rpm-ostree | `rpm-ostree install --allow-inactive python3-psutil python3-scapy` e reinicie após a instalação |
+| Fedora tradicional | `sudo dnf install python3-psutil python3-scapy` |
+| Debian ou Ubuntu | `sudo apt install python3-psutil python3-scapy` |
+
+Com os pacotes do sistema, confira o carregamento com `/usr/bin/python3 -c "import psutil, scapy; print('OK')"` e abra com `/usr/bin/python3 app.py`.
+
 1. Conecte A e B à mesma rede. Em B, abra **Monitor local**, selecione a interface com o IPv4 de B, informe o IPv4 de A e clique em **Iniciar**. Aguarde a indicação de captura ativa.
 2. Para demonstrar a porta em **LISTENING**, use um serviço de teste em B. Com o iperf3 instalado nos dois computadores, execute `iperf3 -s -4` em B. A porta padrão é 5201. No inventário de A, um intervalo de portas que inclua 5201 permite conferir também a acessibilidade pela rede.
 3. Em A, execute `iperf3 -c IP_DE_B -t 15 -b 1M`, substituindo `IP_DE_B` pelo endereço de B. Durante a transferência, mostre **ESTABLISHED**, as portas, o IP de A, a taxa em pacotes/s e o volume TCP.

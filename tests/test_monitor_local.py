@@ -1,5 +1,6 @@
 """Testes do monitor sem exigir acesso privilegiado à interface de rede."""
 import socket
+import sys
 import tkinter as tk
 import unittest
 from types import SimpleNamespace
@@ -83,3 +84,13 @@ class TestJanela(unittest.TestCase):
             janela._atualizar()
             self.assertTrue(janela.iniciar_bt.instate(["!disabled"]))
             self.assertIn("permissão", janela.status.cget("text"))
+
+    def test_sem_psutil_aviso_pode_fechar_com_janela_principal(self):
+        with mock.patch.dict(sys.modules, {"psutil": None}):
+            monitor.abrir_monitor(self.raiz)
+            aviso = self.raiz.children["dependencias_monitor"]
+            monitor.abrir_monitor(self.raiz)
+            self.assertIs(self.raiz.children["dependencias_monitor"], aviso)
+            self.assertIsNone(self.raiz.grab_current())
+            self.raiz.update_idletasks()
+        # O cleanup destrói a raiz ainda com o aviso aberto.
