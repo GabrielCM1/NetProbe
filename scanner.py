@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 WINDOWS = sys.platform.startswith("win")
 
@@ -56,6 +56,9 @@ class Host:
     portas: List[int] = field(default_factory=list)
     ttl: Optional[int] = None   # TTL da resposta do ping (da uma pista do sistema operacional)
     nome: Optional[str] = None  # nome que o aparelho anuncia (mDNS, NetBIOS ou DNS)
+    servicos: Set[str] = field(default_factory=set)   # servicos anunciados por mDNS, ex.: '_airplay'
+    modelo: Optional[str] = None                      # modelo anunciado por mDNS, ex.: 'iPhone14,5'
+    portas_extras: List[int] = field(default_factory=list)  # portas de identificacao abertas
 
     @property
     def fabricante(self) -> Optional[str]:
@@ -546,28 +549,51 @@ def _nome_dns(dados: bytes, pos: int) -> Tuple[str, int]:
     return ".".join(partes), (depois if depois is not None else pos)
 
 
+PTR, TXT = 12, 16      # tipos de registro DNS usados aqui
+
+
+def pergunta_dns(nomes: List[str], tipo: int = PTR) -> bytes:
+    """Monta um pacote de pergunta DNS/mDNS com uma pergunta para cada nome."""
+    corpo = b""
+    for nome in nomes:
+        corpo += b"".join(bytes([len(p)]) + p.encode() for p in nome.split(".")) + b"\x00"
+        corpo += struct.pack(">HH", tipo, 0x8001)   # classe 0x8001 = IN + "responda direto para mim"
+    # cabecalho: id 0, flags 0, N perguntas, 0 respostas
+    return struct.pack(">HHHHHH", 0, 0, len(nomes), 0, 0, 0) + corpo
+
+
 def pergunta_mdns(ip: str) -> bytes:
-    """Pergunta DNS do tipo PTR: 'qual o nome de 18.1.168.192.in-addr.arpa?'"""
-    nome = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
-    corpo = b"".join(bytes([len(p)]) + p.encode() for p in nome.split(".")) + b"\x00"
-    # cabecalho: id 0, 1 pergunta | tipo 12 = PTR, classe 0x8001 = IN + "responda direto para mim"
-    return struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0) + corpo + struct.pack(">HH", 12, 0x8001)
+    """Pergunta PTR reversa: 'qual o nome de 18.1.168.192.in-addr.arpa?'"""
+    return pergunta_dns([".".join(reversed(ip.split("."))) + ".in-addr.arpa"])
+
+
+def registros_dns(dados: bytes) -> List[Tuple[str, int, int, int]]:
+    """Todos os registros de uma resposta DNS: (nome, tipo, inicio dos dados, tamanho).
+
+    PULA a secao de perguntas de proposito: numa resposta mDNS "legacy unicast" o
+    aparelho repete as perguntas que recebeu. Se lessemos tudo, cada aparelho pareceria
+    anunciar todos os servicos que perguntamos (foi o que aconteceu num teste real).
+    Gera IndexError/struct.error se o pacote estiver quebrado."""
+    perguntas, respostas, autoridade, adicionais = struct.unpack(">HHHH", dados[4:12])
+    pos = 12
+    for _ in range(perguntas):
+        pos = _nome_dns(dados, pos)[1] + 4            # nome + tipo (2) + classe (2)
+    registros = []
+    for _ in range(respostas + autoridade + adicionais):
+        nome, pos = _nome_dns(dados, pos)
+        tipo, _, _, tamanho = struct.unpack(">HHIH", dados[pos:pos + 10])   # tipo, classe, TTL, tamanho
+        pos += 10
+        registros.append((nome, tipo, pos, tamanho))
+        pos += tamanho
+    return registros
 
 
 def interpretar_mdns(dados: bytes) -> Optional[str]:
     """Tira o nome da resposta mDNS (o primeiro registro PTR). Ex.: 'Android.local'."""
     try:
-        perguntas, respostas = struct.unpack(">HH", dados[4:8])
-        pos = 12
-        for _ in range(perguntas):
-            pos = _nome_dns(dados, pos)[1] + 4
-        for _ in range(respostas):
-            pos = _nome_dns(dados, pos)[1]
-            tipo, _, _, tamanho = struct.unpack(">HHIH", dados[pos:pos + 10])
-            pos += 10
-            if tipo == 12:
-                return _nome_dns(dados, pos)[0]
-            pos += tamanho
+        for _, tipo, inicio, _ in registros_dns(dados):
+            if tipo == PTR:
+                return _nome_dns(dados, inicio)[0]
     except (IndexError, struct.error):
         pass
     return None
@@ -629,7 +655,7 @@ def nome_dns_reverso(ip: str) -> Optional[str]:
 
 
 # Nomes provisorios que alguns aparelhos anunciam quando nao tem nome configurado
-_NOMES_VAZIOS = {"localhost", "none", "(none)", "unknown", "null", "default"}
+_NOMES_VAZIOS = {"localhost", "none", "(none)", "unknown", "null", "default", "spotifyconnect"}
 
 
 def limpar_nome(nome: Optional[str], ip: str) -> Optional[str]:
@@ -654,6 +680,141 @@ def descobrir_nome(ip: str) -> Optional[str]:
         if nome:
             return nome
     return None
+
+
+# --------------------------------------------------------------------------
+# Servicos mDNS da rede inteira (DNS-SD / Bonjour)
+# --------------------------------------------------------------------------
+# Em vez de perguntar a cada aparelho "qual o seu nome?", perguntamos a REDE INTEIRA
+# (endereco multicast 224.0.0.251) "quem oferece estes servicos?". Isso pega aparelhos
+# que nao respondem a pergunta direta, como iPhones e Macs, e revela:
+#   - o SERVICO: '_companion-link' e '_apple-mobdev2' so existem em aparelhos Apple,
+#     '_googlecast' em Chromecast, '_ipp' em impressoras, '_airplay' em quem recebe AirPlay;
+#   - o NOME AMIGAVEL que o dono deu: 'TV Sala', 'iPhone de Ana';
+#   - o MODELO, no registro TXT: 'model=iPhone14,5', 'rpMd=MacBookPro18,1', 'md=Chromecast'.
+# Funciona mesmo com MAC aleatorio. Mas um iPhone com a tela apagada "dorme" e nao responde.
+SERVICOS_MDNS = [
+    "_services._dns-sd._udp.local",     # "liste todos os seus servicos"
+    "_companion-link._tcp.local", "_apple-mobdev2._tcp.local", "_device-info._tcp.local",
+    "_airplay._tcp.local", "_raop._tcp.local", "_homekit._tcp.local", "_hap._tcp.local",
+    "_googlecast._tcp.local", "_spotify-connect._tcp.local",
+    "_ipp._tcp.local", "_printer._tcp.local", "_pdl-datastream._tcp.local",
+    "_smb._tcp.local", "_workstation._tcp.local",
+]
+_CHAVES_MODELO = ("model", "rpMd", "md", "am", "ty")   # chaves do TXT que trazem o modelo
+
+
+@dataclass
+class InfoMdns:
+    """O que um aparelho anunciou por mDNS."""
+    servicos: Set[str] = field(default_factory=set)    # ex.: {'_airplay', '_raop'}
+    nome: Optional[str] = None                         # ex.: 'TV Sala'
+    modelo: Optional[str] = None                       # ex.: 'iPhone14,5'
+
+
+def _servico_de(nome: str) -> Optional[str]:
+    """'TV Sala._airplay._tcp.local' ou '_airplay._tcp.local' -> '_airplay'."""
+    m = re.search(r"(_[^.]+)\._(?:tcp|udp)\.local$", nome)
+    return m.group(1) if m else None
+
+
+def _ler_txt(dados: bytes, inicio: int, tamanho: int) -> Dict[str, str]:
+    """Registro TXT: varias strings 'chave=valor', cada uma precedida do seu tamanho."""
+    pares, pos, fim = {}, inicio, inicio + tamanho
+    while pos < fim:
+        n = dados[pos]
+        texto = dados[pos + 1:pos + 1 + n].decode("utf-8", errors="ignore")
+        chave, _, valor = texto.partition("=")
+        pares[chave] = valor
+        pos += 1 + n
+    return pares
+
+
+def interpretar_servicos_mdns(dados: bytes) -> InfoMdns:
+    """Le uma resposta mDNS e junta servicos, nome amigavel e modelo anunciados."""
+    info = InfoMdns()
+    try:
+        for nome, tipo, inicio, tamanho in registros_dns(dados):
+            if tipo == PTR:
+                alvo = _nome_dns(dados, inicio)[0]
+                if nome == "_services._dns-sd._udp.local":       # lista de servicos
+                    servico = _servico_de(alvo)
+                else:                                            # instancia: 'TV Sala._airplay._tcp.local'
+                    servico = _servico_de(nome)
+                    instancia = alvo[: -len(nome) - 1] if alvo.endswith("." + nome) else ""
+                    # AirPlay de audio (_raop) usa 'MAC@Nome'; tira a parte antes do @
+                    instancia = instancia.split("@", 1)[-1]
+                    if instancia and not info.nome and not re.fullmatch(r"[0-9A-Fa-f-]{12,}", instancia):
+                        info.nome = instancia
+                if servico:
+                    info.servicos.add(servico)
+            elif tipo == TXT:
+                txt = _ler_txt(dados, inicio, tamanho)
+                if txt.get("fn"):                    # Chromecast: 'fn' e o nome amigavel
+                    info.nome = txt["fn"]
+                for chave in _CHAVES_MODELO:
+                    if txt.get(chave) and not info.modelo:
+                        info.modelo = txt[chave]
+    except (IndexError, struct.error):
+        pass
+    return info
+
+
+def descobrir_servicos_mdns(espera: float = 3.0, parar: Callable[[], bool] = lambda: False,
+                            destino: Tuple[str, int] = ("224.0.0.251", 5353)) -> Dict[str, InfoMdns]:
+    """Pergunta para a rede inteira quem oferece os SERVICOS_MDNS e espera 'espera' segundos.
+    Devolve {ip: InfoMdns} de quem respondeu. 'destino' so muda nos testes."""
+    resultado: Dict[str, InfoMdns] = {}
+    # As perguntas vao em pacotes de 5, para nenhum pacote ficar grande demais
+    pacotes = [pergunta_dns(SERVICOS_MDNS[i:i + 5]) for i in range(0, len(SERVICOS_MDNS), 5)]
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)   # exigido pelo mDNS
+            s.settimeout(0.2)
+            for _ in range(2):              # manda 2 vezes: UDP pode perder pacote
+                for pacote in pacotes:
+                    s.sendto(pacote, destino)
+            fim = time.monotonic() + espera
+            while time.monotonic() < fim and not parar():
+                try:
+                    dados, origem = s.recvfrom(9000)
+                except socket.timeout:
+                    continue
+                info = interpretar_servicos_mdns(dados)
+                junto = resultado.setdefault(origem[0], InfoMdns())
+                junto.servicos |= info.servicos
+                junto.nome = junto.nome or info.nome
+                junto.modelo = junto.modelo or info.modelo
+    except OSError:                         # sem rede, multicast bloqueado...
+        pass
+    return {ip: i for ip, i in resultado.items() if i.servicos or i.nome or i.modelo}
+
+
+def aplicar_mdns(h: Host, info: InfoMdns):
+    """Junta no Host o que ele anunciou por mDNS. O nome amigavel ('TV Sala') tem
+    preferencia sobre o nome tecnico do aparelho ('Android', 'localhost')."""
+    h.servicos |= info.servicos
+    h.modelo = info.modelo or h.modelo
+    h.nome = limpar_nome(info.nome, h.ip) or h.nome
+
+
+# --------------------------------------------------------------------------
+# Portas de identificacao
+# --------------------------------------------------------------------------
+# Algumas portas "entregam" o tipo de aparelho, mas ficam fora do intervalo padrao (1-1024).
+# Elas sao testadas sempre, a parte, so para o palpite: nao entram em "Portas abertas",
+# que continua mostrando exatamente o intervalo escolhido na tela.
+PORTAS_IDENTIFICACAO = [62078, 7000, 8008, 8009, 9100, 631, 548, 3389, 445, 554, 1883]
+
+
+def escanear_portas_identificacao(ip: str, inicio: int, fim: int, timeout_ms: int,
+                                  parar: Callable[[], bool] = lambda: False) -> List[int]:
+    """Testa as PORTAS_IDENTIFICACAO que ficaram fora do intervalo [inicio, fim]."""
+    fora = [p for p in PORTAS_IDENTIFICACAO if not inicio <= p <= fim]
+    abertas = []
+    em_paralelo(lambda p: porta_aberta(ip, p, timeout_ms), fora, len(fora) or 1, parar,
+                lambda p, aberta: abertas.append(p) if aberta else None)
+    return sorted(abertas)
 
 
 def ler_gateway(saida: str) -> Optional[str]:
@@ -687,6 +848,26 @@ _PISTAS_NOME = [
     (("raspberrypi",), "Raspberry Pi"),
     (("esp_", "esp-", "esp32", "esp8266", "tasmota", "shelly", "sonoff"), "Casa inteligente (IoT)"),
     (("tv", "bravia", "roku", "tizen", "webos"), "Smart TV"),
+]
+def tipo_pelo_modelo(modelo: Optional[str]) -> Optional[str]:
+    """Modelos da Apple tem um codigo fixo: 'iPhone14,5', 'iPad13,1', 'MacBookPro18,1',
+    'AppleTV11,1', 'AudioAccessory5,1' (HomePod), 'Watch6,1'."""
+    m = (modelo or "").lower()
+    for prefixo, tipo in (("iphone", "iPhone"), ("ipad", "iPad"), ("ipod", "iPod"),
+                          ("macbook", "Mac (notebook)"), ("imac", "Mac"), ("macmini", "Mac"),
+                          ("macpro", "Mac"), ("mac", "Mac"), ("appletv", "Apple TV"),
+                          ("audioaccessory", "HomePod"), ("watch", "Apple Watch")):
+        if m.startswith(prefixo):
+            return tipo
+    return None
+
+
+_MARCAS_DE_TV = ("samsung", "lg electronics", "sony", "tcl", "philips", "hisense", "vizio", "roku")
+_PISTAS_SERVICOS = [
+    ({"_companion-link", "_apple-mobdev2"}, "Aparelho Apple (iPhone, iPad, Mac)"),
+    ({"_googlecast"}, "Chromecast / Google TV"),
+    ({"_ipp", "_printer", "_pdl-datastream"}, "Impressora"),
+    ({"_hap", "_homekit"}, "Casa inteligente (HomeKit)"),
 ]
 _PISTAS_PORTAS = [
     ({62078}, "iPhone/iPad"),
@@ -726,23 +907,37 @@ def palpite_tipo(h: Host, gateway: Optional[str] = None) -> str:
     """Palpite de QUE aparelho e, juntando as pistas. Devolve '' se nao der para saber.
     E um palpite: um nome ou uma porta podem enganar.
 
-    A ordem importa: a primeira pista que bater decide. O nome vem primeiro porque e
-    o proprio aparelho dizendo o que e; o fabricante vem depois das portas porque uma
-    Samsung pode ser celular ou TV, mas a porta 8009 aberta indica que tem Chromecast."""
+    A ordem importa: a primeira pista que bater decide. O modelo vem primeiro porque e
+    o proprio aparelho dizendo exatamente o que e ('iPhone14,5'); depois o nome e os
+    servicos mDNS; o fabricante vem depois das portas porque uma Samsung pode ser
+    celular ou TV, mas a porta 8009 aberta indica que tem Chromecast."""
     if h.este_pc:
         return "Este computador"
     if gateway and h.ip == gateway:
         return "Roteador (gateway da rede)"
-    nome, fab, portas = (h.nome or "").lower(), (h.fabricante or "").lower(), set(h.portas)
+    pelo_modelo = tipo_pelo_modelo(h.modelo)
+    if pelo_modelo:
+        return pelo_modelo
+    nome, fab = (h.nome or "").lower(), (h.fabricante or "").lower()
+    portas = set(h.portas) | set(h.portas_extras)
     for chaves, tipo in _PISTAS_NOME:
         if any(c in nome for c in chaves):
             return tipo
+    for chaves, tipo in _PISTAS_SERVICOS:
+        if h.servicos & chaves:
+            return tipo
+    if h.servicos & {"_airplay", "_raop"}:          # recebe AirPlay: TV de outra marca ou Apple TV
+        if any(marca in fab for marca in _MARCAS_DE_TV):
+            return "Smart TV (com AirPlay)"
+        return "Aparelho com AirPlay (Apple TV, caixa de som)"
     for chaves, tipo in _PISTAS_PORTAS:
         if portas & chaves:
             return tipo
     for chaves, tipo in _PISTAS_FABRICANTE:
         if any(c in fab for c in chaves):
             return tipo
+    if "_spotify-connect" in h.servicos:
+        return "Caixa de som / assistente de voz"
     if mac_aleatorio(h.mac):
         return "Celular ou notebook (MAC privado)"
     if h.ttl:                         # TTL inicial: 64 Linux/Android/Apple, 128 Windows, 255 rede
@@ -768,11 +963,20 @@ if __name__ == "__main__":
     hosts = varrer_rede(rede, timeout, lambda ip, h: None)
     print("Pronto em %.1f s. %d dispositivo(s):" % (time.time() - t0, len(hosts)))
     gateway = gateway_padrao()
+    servicos = descobrir_servicos_mdns()
     for h in hosts:
         h.portas = escanear_portas(h.ip, 1, 1024, 300)
-        h.nome = None if h.este_pc else descobrir_nome(h.ip)
+        h.portas_extras = escanear_portas_identificacao(h.ip, 1, 1024, 300)
+        if not h.este_pc:
+            h.nome = descobrir_nome(h.ip)
+            if h.ip in servicos:
+                aplicar_mdns(h, servicos[h.ip])
         print("  %-15s %-17s %-4s %6s  portas: %s" % (
             h.ip, h.mac or "?", h.metodo, texto_tempo(h.tempo_ms),
             ", ".join(nome_porta(p) for p in h.portas) or "nenhuma"))
         print("  %15s fabricante: %s | nome: %s | tipo provável: %s" % (
             "", texto_fabricante(h.mac), h.nome or "-", palpite_tipo(h, gateway) or "?"))
+        if h.servicos or h.modelo or h.portas_extras:
+            print("  %15s mDNS: %s | modelo: %s | portas de identificação: %s" % (
+                "", ", ".join(sorted(h.servicos)) or "-", h.modelo or "-",
+                ", ".join(nome_porta(p) for p in h.portas_extras) or "-"))

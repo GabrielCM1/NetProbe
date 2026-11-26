@@ -283,12 +283,22 @@ class NetProbeApp:
                 self.fila.put(("portas_inicio", h.ip))
                 portas = scanner.escanear_portas(h.ip, p["porta_ini"], p["porta_fim"],
                                                  p["timeout_porta"], parar=self.parar_evento.is_set)
+                # Portas que entregam o tipo de aparelho (ex.: 62078 = iPhone), fora do intervalo
+                extras = scanner.escanear_portas_identificacao(
+                    h.ip, p["porta_ini"], p["porta_fim"], p["timeout_porta"], parar=self.parar_evento.is_set)
                 if not self.parar_evento.is_set():
-                    self.fila.put(("portas", h.ip, portas))
+                    self.fila.put(("portas", h.ip, portas, extras))
+
+            def servicos_mdns():
+                # Uma pergunta para a REDE INTEIRA por rodada (pega iPhones, Macs, TVs...)
+                resultado = scanner.descobrir_servicos_mdns(parar=self.parar_evento.is_set)
+                if not self.parar_evento.is_set():
+                    self.fila.put(("mdns", resultado))
 
             # Os nomes sao perguntados ao mesmo tempo que as portas sao testadas
             nomes = ThreadPoolExecutor(max_workers=16)
             try:
+                nomes.submit(servicos_mdns)
                 for h in pendentes:
                     nomes.submit(nome_de, h)
                 with ThreadPoolExecutor(max_workers=HOSTS_EM_PARALELO) as pool:
@@ -310,8 +320,9 @@ class NetProbeApp:
           ("ip", ip, host ou None)       terminou um IP (None = vazio)
           ("varredura_ok", ips, segundos) terminou o ping+ARP de todos
           ("portas_inicio", ip)          comecou o teste de portas deste IP
-          ("portas", ip, [portas])       terminou o teste de portas
+          ("portas", ip, [portas], [extras]) terminou o teste de portas (extras = de identificacao)
           ("nome", ip, nome)             o aparelho disse o proprio nome
+          ("mdns", {ip: InfoMdns})       servicos/nome/modelo anunciados na rede inteira
           ("fim", parado)                acabou a rodada (parado = clicaram em Parar)
           ("erro", texto)                deu erro inesperado na thread"""
         try:
@@ -339,16 +350,19 @@ class NetProbeApp:
                 elif tipo == "portas":
                     ip, portas = msg[1], msg[2]
                     self.hosts[ip].portas = portas
+                    self.hosts[ip].portas_extras = msg[3]
                     self.portas_feitas.add(ip)
                     self._desenhar_linha(ip)      # as portas tambem mudam o "tipo provavel"
                     if portas:
                         self.log("%s: portas abertas %s" % (ip, ", ".join(map(str, portas))))
                 elif tipo == "nome":
                     ip, nome = msg[1], msg[2]
-                    if self.hosts[ip].nome != nome:
+                    if not self.hosts[ip].nome:          # o nome amigavel do mDNS tem preferencia
                         self.hosts[ip].nome = nome
                         self.log("%s se identificou como \"%s\"" % (ip, nome))
                         self._desenhar_linha(ip)
+                elif tipo == "mdns":
+                    self._servicos_mdns(msg[1])
                 elif tipo == "fim":
                     self._terminou(parado=msg[1])
                 elif tipo == "erro":
@@ -389,8 +403,11 @@ class NetProbeApp:
             h.ttl = h.ttl or anterior.ttl        # rodada por ARP nao tem TTL
             if anterior.mac and h.mac != anterior.mac:
                 self._mac_mudou(h.ip, anterior.mac, h.mac, estava_offline=(antes == "offline"))
-            else:
-                h.nome = h.nome or anterior.nome # mesmo aparelho: mantem o nome descoberto
+            else:                                # mesmo aparelho: mantem o que ja foi descoberto
+                h.nome = h.nome or anterior.nome
+                h.servicos = h.servicos or anterior.servicos
+                h.modelo = h.modelo or anterior.modelo
+                h.portas_extras = h.portas_extras or anterior.portas_extras
         self.hosts[h.ip] = h
         self.status[h.ip] = "arp" if h.metodo == "ARP" else "online"
         self.visto[h.ip] = time.strftime("%H:%M:%S")
@@ -403,6 +420,20 @@ class NetProbeApp:
         elif antes == "offline":
             self.log("%s voltou a ficar ONLINE" % h.ip)
         self._desenhar_linha(h.ip)
+
+    def _servicos_mdns(self, resultado):
+        """Aplica o que cada aparelho anunciou por mDNS (servicos, nome amigavel, modelo)."""
+        for ip, info in resultado.items():
+            h = self.hosts.get(ip)
+            if h is None or h.este_pc or self.status.get(ip) == "offline":
+                continue
+            antes = (h.nome, h.modelo, set(h.servicos))
+            scanner.aplicar_mdns(h, info)
+            if (h.nome, h.modelo, h.servicos) != antes:
+                detalhes = [x for x in (h.nome and '"%s"' % h.nome, h.modelo and "modelo " + h.modelo) if x]
+                self.log("%s anunciou por mDNS: %s" % (
+                    ip, ", ".join(detalhes + [", ".join(sorted(h.servicos))])))
+                self._desenhar_linha(ip)
 
     def _mac_mudou(self, ip, mac_antigo, mac_novo, estava_offline):
         """Deteccao de COLISAO DE IP: o mesmo IP respondeu com outro MAC.
@@ -479,6 +510,11 @@ class NetProbeApp:
                       if o != ip and x.mac == h.mac and self.status.get(o) != "offline"]
             if outros:
                 obs.append("mesmo MAC que " + ", ".join(sorted(outros, key=ipaddress.ip_address)))
+        if h.modelo:
+            obs.append("modelo " + h.modelo)
+        if h.portas_extras:
+            # Portas fora do intervalo escolhido, testadas so para identificar o aparelho
+            obs.append("porta de identificação: " + ", ".join(scanner.nome_porta(p) for p in h.portas_extras))
         return "; ".join(obs)
 
     def _set_coluna(self, ip, coluna, valor):

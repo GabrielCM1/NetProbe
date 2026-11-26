@@ -115,5 +115,34 @@ class TestInterface(unittest.TestCase):
         self.assertEqual(self.linha("10.0.0.4")["tag"], "online")
 
 
+    def test_mdns_identifica_iphone_com_mac_privado(self):
+        self.rodada([scanner.Host("10.0.0.56", "6A-25-C6-23-AF-B0", "ARP", None)])
+        self.app.fila.put(("mdns", {"10.0.0.56": scanner.InfoMdns({"_companion-link"}, "iPhone de Ana",
+                                                                  "iPhone14,5")}))
+        self.app._processar_fila()
+        linha = self.linha("10.0.0.56")
+        self.assertEqual((linha["nome"], linha["tipo"]), ("iPhone de Ana", "iPhone"))
+        self.assertIn("modelo iPhone14,5", linha["obs"])
+        # Na rodada seguinte o iPhone "dormiu" e nao respondeu ao mDNS: o que ja se sabia fica
+        self.rodada([scanner.Host("10.0.0.56", "6A-25-C6-23-AF-B0", "ARP", None)])
+        self.assertEqual(self.linha("10.0.0.56")["tipo"], "iPhone")
+
+    def test_porta_de_identificacao_vai_para_observacoes_e_nao_para_portas(self):
+        self.rodada([scanner.Host("10.0.0.56", "6A-25-C6-23-AF-B0", "PING", 300)])
+        self.app.fila.put(("portas", "10.0.0.56", [], [62078]))
+        self.app._processar_fila()
+        linha = self.linha("10.0.0.56")
+        self.assertEqual(linha["portas"], "nenhuma no intervalo")
+        self.assertIn("62078 (iPhone-sync)", linha["obs"])
+        self.assertEqual(linha["tipo"], "iPhone/iPad")
+
+    def test_nome_amigavel_do_mdns_ganha_do_nome_tecnico(self):
+        self.rodada([scanner.Host("10.0.0.2", "00-7D-3B-20-1D-78", "PING", 2)])
+        self.app.fila.put(("mdns", {"10.0.0.2": scanner.InfoMdns({"_airplay"}, "TV Sala", "Q70F")}))
+        self.app.fila.put(("nome", "10.0.0.2", "tizen-tecnico"))
+        self.app._processar_fila()
+        self.assertEqual(self.linha("10.0.0.2")["nome"], "TV Sala")
+        self.assertEqual(self.linha("10.0.0.2")["tipo"], "Smart TV")
+
 if __name__ == "__main__":
     unittest.main()

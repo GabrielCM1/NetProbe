@@ -289,7 +289,7 @@ class TestNomes(unittest.TestCase):
     def test_limpar_nome(self):
         self.assertEqual(scanner.limpar_nome("Android.local.", "192.168.1.18"), "Android")
         self.assertEqual(scanner.limpar_nome("notebook-joao.lan", "192.168.1.9"), "notebook-joao")
-        for inutil in ("localhost.local", "none.local", "unknown", "_gateway", "192.168.1.18", "192-168-1-18.provedor.net", "", None):
+        for inutil in ("localhost.local", "none.local", "unknown", "SpotifyConnect", "_gateway", "192.168.1.18", "192-168-1-18.provedor.net", "", None):
             self.assertIsNone(scanner.limpar_nome(inutil, "192.168.1.18"), inutil)
 
     def test_descobrir_nome_usa_o_primeiro_que_funcionar(self):
@@ -363,6 +363,136 @@ class TestPalpiteTipo(unittest.TestCase):
         self.assertEqual(scanner.palpite_tipo(self.host(ttl=128)), "Computador Windows")
         self.assertEqual(scanner.palpite_tipo(self.host(ttl=255)), "Equipamento de rede")
         self.assertEqual(scanner.palpite_tipo(self.host()), "")
+
+
+def _nome(n: str) -> bytes:
+    return b"".join(bytes([len(p)]) + p.encode() for p in n.split(".")) + b"\x00"
+
+
+def _registro(dono: str, tipo: int, dados: bytes) -> bytes:
+    return _nome(dono) + struct.pack(">HHIH", tipo, 0x8001, 120, len(dados)) + dados
+
+
+def _txt(**pares) -> bytes:
+    return b"".join(bytes([len(t)]) + t for t in ("%s=%s" % kv for kv in pares.items()) for t in [t.encode()])
+
+
+def _resposta(perguntas, respostas, adicionais=()) -> bytes:
+    """Resposta mDNS como a de um aparelho real: REPETE as perguntas (legacy unicast)."""
+    corpo = b"".join(_nome(n) + struct.pack(">HH", 12, 0x8001) for n in perguntas)
+    corpo += b"".join(respostas) + b"".join(adicionais)
+    return struct.pack(">HHHHHH", 0, 0x8400, len(perguntas), len(respostas), 0, len(adicionais)) + corpo
+
+
+class TestServicosMdns(unittest.TestCase):
+    PERGUNTAS = ["_companion-link._tcp.local", "_airplay._tcp.local", "_services._dns-sd._udp.local"]
+
+    def test_tv_com_airplay(self):
+        dados = _resposta(self.PERGUNTAS,
+                          [_registro("_airplay._tcp.local", 12, _nome("TV Sala._airplay._tcp.local"))],
+                          [_registro("TV Sala._airplay._tcp.local", 16, _txt(model="Q70F", deviceid="00:7D"))])
+        info = scanner.interpretar_servicos_mdns(dados)
+        self.assertEqual((info.servicos, info.nome, info.modelo), ({"_airplay"}, "TV Sala", "Q70F"))
+
+    def test_perguntas_repetidas_nao_viram_servicos(self):
+        """Bug visto numa rede real: o Echo repetia as perguntas e parecia anunciar _companion-link."""
+        dados = _resposta(self.PERGUNTAS,
+                          [_registro("_services._dns-sd._udp.local", 12, _nome("_spotify-connect._tcp.local"))])
+        self.assertEqual(scanner.interpretar_servicos_mdns(dados).servicos, {"_spotify-connect"})
+
+    def test_iphone_pelo_modelo(self):
+        dados = _resposta([], [_registro("_companion-link._tcp.local", 12,
+                                         _nome("iPhone de Ana._companion-link._tcp.local"))],
+                          [_registro("iPhone de Ana._companion-link._tcp.local", 16, _txt(rpMd="iPhone14,5"))])
+        info = scanner.interpretar_servicos_mdns(dados)
+        self.assertEqual((info.nome, info.modelo), ("iPhone de Ana", "iPhone14,5"))
+        self.assertIn("_companion-link", info.servicos)
+
+    def test_raop_tira_o_mac_do_nome_e_chromecast_usa_fn(self):
+        raop = _resposta([], [_registro("_raop._tcp.local", 12, _nome("A1B2C3D4E5F6@Caixa Cozinha._raop._tcp.local"))])
+        self.assertEqual(scanner.interpretar_servicos_mdns(raop).nome, "Caixa Cozinha")
+        cast = _resposta([], [_registro("_googlecast._tcp.local", 12,
+                                        _nome("Chromecast-8a1b2c3d4e5f6a7b._googlecast._tcp.local"))],
+                         [_registro("Chromecast-8a1b2c3d4e5f6a7b._googlecast._tcp.local", 16,
+                                    _txt(md="Chromecast", fn="TV do Quarto"))])
+        info = scanner.interpretar_servicos_mdns(cast)
+        self.assertEqual((info.nome, info.modelo), ("TV do Quarto", "Chromecast"))
+
+    def test_pacote_quebrado(self):
+        self.assertEqual(scanner.interpretar_servicos_mdns(b"\x00\x01").servicos, set())
+
+    def test_descoberta_de_verdade_com_aparelho_falso(self):
+        """Um 'aparelho' em 127.0.0.1 recebe as perguntas pela rede e responde."""
+        servidor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        servidor.bind(("127.0.0.1", 0))
+        resposta = _resposta([], [_registro("_companion-link._tcp.local", 12,
+                                            _nome("MacBook do Joao._companion-link._tcp.local"))],
+                             [_registro("MacBook do Joao._companion-link._tcp.local", 16,
+                                        _txt(rpMd="MacBookPro18,1"))])
+
+        def responder():
+            _, origem = servidor.recvfrom(2048)
+            servidor.sendto(resposta, origem)
+        threading.Thread(target=responder, daemon=True).start()
+        try:
+            achados = scanner.descobrir_servicos_mdns(espera=1.0, destino=servidor.getsockname())
+        finally:
+            servidor.close()
+        info = achados["127.0.0.1"]
+        self.assertEqual((info.nome, info.modelo), ("MacBook do Joao", "MacBookPro18,1"))
+
+    def test_aplicar_mdns_prefere_nome_amigavel(self):
+        h = scanner.Host("10.0.0.2", None, "PING", 1)
+        h.nome = "localhost-tecnico"
+        scanner.aplicar_mdns(h, scanner.InfoMdns({"_airplay"}, "TV Sala", "Q70F"))
+        self.assertEqual((h.nome, h.modelo, h.servicos), ("TV Sala", "Q70F", {"_airplay"}))
+        scanner.aplicar_mdns(h, scanner.InfoMdns({"_googlecast"}, None, None))
+        self.assertEqual((h.nome, h.servicos), ("TV Sala", {"_airplay", "_googlecast"}))
+
+
+class TestPortasIdentificacao(unittest.TestCase):
+    def test_so_testa_as_que_ficaram_fora_do_intervalo(self):
+        testadas = []
+
+        def falsa(ip, porta, timeout):
+            testadas.append(porta)
+            return porta == 62078
+        with mock.patch.object(scanner, "porta_aberta", side_effect=falsa):
+            abertas = scanner.escanear_portas_identificacao("10.0.0.5", 1, 1024, 300)
+        self.assertEqual(abertas, [62078])
+        self.assertNotIn(445, testadas)      # 445 ja esta no intervalo 1-1024
+        self.assertIn(62078, testadas)
+
+    def test_intervalo_que_cobre_tudo_nao_testa_nada(self):
+        with mock.patch.object(scanner, "porta_aberta") as porta:
+            self.assertEqual(scanner.escanear_portas_identificacao("10.0.0.5", 1, 65535, 300), [])
+        porta.assert_not_called()
+
+
+class TestPalpiteComMdns(unittest.TestCase):
+    def host(self, mac="0C-00-00-00-00-01", **campos):
+        h = scanner.Host("10.0.0.9", mac, "PING", 1)
+        for chave, valor in campos.items():
+            setattr(h, chave, valor)
+        return h
+
+    def test_modelo_apple(self):
+        for modelo, tipo in (("iPhone14,5", "iPhone"), ("iPad13,1", "iPad"), ("MacBookPro18,1", "Mac (notebook)"),
+                             ("Mac14,2", "Mac"), ("AppleTV11,1", "Apple TV"), ("AudioAccessory5,1", "HomePod")):
+            self.assertEqual(scanner.palpite_tipo(self.host(modelo=modelo)), tipo, modelo)
+
+    def test_servicos(self):
+        self.assertIn("Apple", scanner.palpite_tipo(self.host(mac="6A-25-C6-23-AF-B0", servicos={"_companion-link"})))
+        self.assertEqual(scanner.palpite_tipo(self.host(servicos={"_googlecast"})), "Chromecast / Google TV")
+        self.assertEqual(scanner.palpite_tipo(self.host(servicos={"_ipp"})), "Impressora")
+
+    def test_airplay_numa_tv_samsung_nao_e_apple(self):
+        tv = self.host(mac="00-7D-3B-20-1D-78", servicos={"_airplay"})
+        self.assertEqual(scanner.palpite_tipo(tv), "Smart TV (com AirPlay)")
+
+    def test_iphone_com_mac_privado_pela_porta_62078(self):
+        iphone = self.host(mac="6A-25-C6-23-AF-B0", portas_extras=[62078])
+        self.assertEqual(scanner.palpite_tipo(iphone), "iPhone/iPad")
 
 
 if __name__ == "__main__":
