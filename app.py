@@ -34,7 +34,7 @@ class NetProbeApp:
     def __init__(self, janela: tk.Tk):
         self.janela = janela
         janela.title("NetProbe Wi-Fi")
-        janela.geometry("1200x700")
+        janela.geometry("1400x700")
         janela.minsize(900, 560)
 
         # Estado do programa
@@ -118,10 +118,11 @@ class NetProbeApp:
         # --- tabela de dispositivos
         tab = ttk.Frame(self.janela, padding=(10, 6))
         tab.pack(fill="both", expand=True)
-        colunas = [("ip", "IP", 115), ("mac", "MAC", 145), ("status", "Status", 70),
-                   ("metodo", "Descoberto por", 145), ("tempo", "Resposta", 70),
-                   ("portas", "Portas abertas", 250), ("visto", "Visto por último", 105),
-                   ("obs", "Observações", 220)]
+        colunas = [("ip", "IP", 110), ("mac", "MAC", 140), ("fabricante", "Fabricante", 150),
+                   ("status", "Status", 65), ("metodo", "Descoberto por", 140),
+                   ("tempo", "Resposta", 70), ("ttl", "TTL (sistema)", 170),
+                   ("portas", "Portas abertas", 230), ("visto", "Visto por último", 105),
+                   ("obs", "Observações", 200)]
         self.colunas = colunas
         self.tabela = ttk.Treeview(tab, columns=[c[0] for c in colunas], show="headings")
         for chave, titulo, largura in colunas:
@@ -344,6 +345,7 @@ class NetProbeApp:
             anterior = self.hosts[h.ip]
             h.portas = anterior.portas           # mantem as portas ja descobertas
             h.mac = h.mac or anterior.mac        # se o ARP falhou agora, mantem o MAC anterior
+            h.ttl = h.ttl or anterior.ttl        # rodada achada so por ARP nao tem TTL
             if anterior.mac and h.mac != anterior.mac:
                 self._mac_mudou(h.ip, anterior.mac, h.mac, estava_offline=(antes == "offline"))
         self.hosts[h.ip] = h
@@ -407,8 +409,9 @@ class NetProbeApp:
             portas = "-"
         else:
             portas = "aguardando..."
-        valores = (ip, h.mac or "desconhecido", nome_status, metodo, tempo, portas,
-                   self.visto.get(ip, "-"), self._observacoes(ip))
+        ttl = "%d (%s)" % (h.ttl, scanner.palpite_sistema(h.ttl)) if h.ttl else "-"
+        valores = (ip, h.mac or "desconhecido", scanner.fabricante(h.mac) or "-", nome_status,
+                   metodo, tempo, ttl, portas, self.visto.get(ip, "-"), self._observacoes(ip))
         tag = "conflito" if ip in self.conflitos and st != "offline" else st
         if self.tabela.exists(ip):
             self.tabela.item(ip, values=valores, tags=(tag,))

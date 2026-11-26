@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -50,6 +51,7 @@ class Host:
     tempo_ms: Optional[float]   # tempo de resposta do ping (None se veio do ARP)
     este_pc: bool = False       # True se for o proprio computador que esta varrendo
     portas: List[int] = field(default_factory=list)
+    ttl: Optional[int] = None   # TTL da resposta do ping (da uma pista do sistema operacional)
 
 
 # --------------------------------------------------------------------------
@@ -190,8 +192,27 @@ def interpretar_ping(saida: Optional[str]) -> Optional[float]:
     return float(m.group(1).replace(",", ".")) if m else 0.0
 
 
-def fazer_ping(ip: str, timeout_ms: int) -> Optional[float]:
-    """Manda 1 ping. Devolve o tempo de resposta em ms, ou None se nao respondeu.
+def interpretar_ttl(saida: Optional[str]) -> Optional[int]:
+    """'... TTL=128' (Windows) ou '... ttl=64 ...' (Linux) -> 128 / 64."""
+    m = re.search(r"TTL=(\d+)", saida or "", re.I)
+    return int(m.group(1)) if m else None
+
+
+def palpite_sistema(ttl: Optional[int]) -> str:
+    """Cada sistema comeca o TTL num valor: 64 (Linux, Android, iPhone, Mac),
+    128 (Windows) ou 255 (roteadores e equipamentos de rede). Cada roteador no
+    caminho tira 1, mas numa rede local o valor chega quase igual ao inicial."""
+    if not ttl:
+        return ""
+    if ttl > 128:
+        return "equipamento de rede"
+    if ttl > 64:
+        return "Windows"
+    return "Linux/Android/Apple"
+
+
+def fazer_ping(ip: str, timeout_ms: int) -> Optional[Tuple[float, Optional[int]]]:
+    """Manda 1 ping. Devolve (tempo de resposta em ms, TTL), ou None se nao respondeu.
 
     Windows:  ping -n 1 -w <ms>  (um pacote, timeout em milissegundos)
     Linux:    ping -c 1 -W <s>   (um pacote, timeout em segundos, aceita fracao)"""
@@ -199,7 +220,9 @@ def fazer_ping(ip: str, timeout_ms: int) -> Optional[float]:
         comando = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
     else:
         comando = ["ping", "-c", "1", "-n", "-W", "%.3f" % (timeout_ms / 1000), ip]
-    return interpretar_ping(_executar(comando, timeout=timeout_ms / 1000 + 3))
+    saida = _executar(comando, timeout=timeout_ms / 1000 + 3)
+    tempo = interpretar_ping(saida)
+    return None if tempo is None else (tempo, interpretar_ttl(saida))
 
 
 # --------------------------------------------------------------------------
@@ -365,14 +388,15 @@ def verificar_ip(ip: str, timeout_ms: int, meus_ips: List[str]) -> Optional[Host
     if ip in meus_ips:
         return Host(ip, mac_deste_pc(ip), "PING", 0, este_pc=True)
 
-    tempo = fazer_ping(ip, timeout_ms)
-    if tempo is not None:
+    resposta = fazer_ping(ip, timeout_ms)
+    if resposta is not None:
+        tempo, ttl = resposta
         # Ja sabemos que existe. O ping ja fez o ARP, entao o MAC esta no cache.
         if WINDOWS:
             mac = sondar_arp(ip, tentativas=2) or mac_da_tabela_arp(ip)
         else:
             mac = mac_da_tabela_arp(ip) or sondar_arp(ip, tentativas=1)
-        return Host(ip, mac, "PING", tempo)
+        return Host(ip, mac, "PING", tempo, ttl=ttl)
 
     mac = sondar_arp(ip, tentativas=2)   # 2 tentativas: aparelhos dormindo demoram a responder
     if mac is not None:
@@ -432,6 +456,49 @@ def nome_porta(p: int) -> str:
     return "%d (%s)" % (p, nome) if nome else str(p)
 
 
+# --------------------------------------------------------------------------
+# Fabricante pelo MAC
+# --------------------------------------------------------------------------
+# Os 3 primeiros bytes do MAC (o "OUI") sao comprados pelo fabricante e registrados
+# publicamente pelo IEEE. Ex.: F4-E8-4F-... = ZTE. A lista fica em fabricantes.txt
+# (copia do registro do IEEE mantida pelo Wireshark). O programa nao acessa a internet.
+ARQUIVO_FABRICANTES = Path(__file__).resolve().parent / "fabricantes.txt"
+_fabricantes: Optional[Dict[str, str]] = None
+
+
+def carregar_fabricantes() -> Dict[str, str]:
+    """Le o fabricantes.txt so na 1a vez: {'F4E84F': 'ZTE', ...}. Sem o arquivo, fica vazio."""
+    global _fabricantes
+    if _fabricantes is None:
+        tabela = {}
+        try:
+            with open(ARQUIVO_FABRICANTES, encoding="utf-8") as f:
+                for linha in f:
+                    prefixo, _, nome = linha.rstrip("\n").partition("\t")
+                    if nome and not linha.startswith("#"):
+                        tabela[prefixo] = nome
+        except OSError:
+            pass
+        _fabricantes = tabela
+    return _fabricantes
+
+
+def fabricante(mac: Optional[str]) -> Optional[str]:
+    """'F4-E8-4F-98-1B-94' -> 'ZTE'. None se nao souber.
+    MAC aleatorio nao tem fabricante: foi inventado pelo aparelho, por privacidade."""
+    if not mac or mac_aleatorio(mac):
+        return None
+    hexa = mac.replace("-", "")
+    tabela = carregar_fabricantes()
+    # O IEEE tambem vende blocos menores (prefixos de 7 e 9 digitos) dentro de um OUI,
+    # entao o prefixo mais longo e procurado primeiro.
+    for tamanho in (9, 7, 6):
+        nome = tabela.get(hexa[:tamanho])
+        if nome:
+            return nome
+    return None
+
+
 def texto_tempo(tempo_ms: Optional[float]) -> str:
     """2.87 -> '3 ms';  0.4 -> '<1 ms';  None -> '-'."""
     if tempo_ms is None:
@@ -458,3 +525,5 @@ if __name__ == "__main__":
         print("  %-15s %-17s %-4s %6s  portas: %s%s" % (
             h.ip, h.mac or "?", h.metodo, texto_tempo(h.tempo_ms),
             ", ".join(nome_porta(p) for p in h.portas) or "nenhuma", extra))
+        print("  %15s fabricante: %s | TTL: %s %s" % (
+            "", fabricante(h.mac) or "-", h.ttl or "-", palpite_sistema(h.ttl)))
