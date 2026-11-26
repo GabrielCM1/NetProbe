@@ -324,6 +324,27 @@ Medido num notebook com Linux (Fedora) e Wi-Fi doméstico, rede /24 com 7 aparel
 
 O tempo total depende principalmente dos IPs **vazios**. Cada um espera as duas tentativas de ARP, cerca de 3 s cada, e todos esperam ao mesmo tempo.
 
+### 6.1. Análise do tráfego gerado por uma varredura
+
+Quantos pacotes o NetProbe coloca na rede numa rodada completa, para uma /24 (254 IPs) com **N** aparelhos online e o intervalo de portas padrão (1 a 1024). Os números saem direto da lógica do `scanner.py`:
+
+| Etapa | Pacotes enviados | Exemplo com N = 8 |
+|---|---|---|
+| Ping sweep | 1 ICMP Echo Request por IP | 254 |
+| Sondagem ARP (só IPs que não responderam ao ping) | Linux: até 2 tentativas × 3 ARP Requests do kernel = **6 por IP vazio**. Windows: 2 chamadas `SendARP` | ~1.476 (Linux) |
+| Portas do intervalo | 1 SYN por porta por aparelho online | 8 × 1.024 = 8.192 |
+| Portas de identificação | Só as que ficam fora do intervalo: 62078, 7000, 8008, 8009, 9100, 1883, 3389 | 8 × 7 = 56 |
+| Nome do aparelho | Até 3 perguntas UDP por aparelho (mDNS, NetBIOS, DNS reverso), para na primeira que responder | ≤ 24 |
+| Serviços mDNS | 15 serviços em pacotes de 5 = 3 pacotes, enviados 2 vezes, multicast `224.0.0.251` | 6 |
+
+**Conclusões:**
+
+- O que mais pesa é o **scan de portas** (cerca de 1.000 SYN por aparelho). Diminuir o intervalo de portas é a forma mais eficaz de deixar a varredura mais leve.
+- O **ARP** é a segunda maior parcela, e cresce com os IPs **vazios**, não com os ocupados. Numa rede cheia, a varredura fica mais rápida e gera menos ARP.
+- O ping sweep é praticamente desprezível: 254 pacotes pequenos.
+- Mesmo no pior caso, o total fica na casa de 10 mil pacotes pequenos, espalhados em ~10 s. Uma rede doméstica suporta isso sem impacto perceptível.
+- No modo monitorar, as portas só são testadas de novo para aparelhos **novos**, que **voltaram** ou que **trocaram de MAC** (`portas_feitas` em `app.py`). As rodadas seguintes custam basicamente o ping sweep e o ARP.
+
 ---
 
 ## 7. Testes automatizados
