@@ -985,6 +985,6 @@ if __name__ == "__main__":
                 aplicar_mdns(h, servicos[h.ip])
         print("  %-15s %-17s %-4s %6s  portas: %s" % (
             h.ip, h.mac or "?", h.metodo, texto_tempo(h.tempo_ms),
-            ", ".join(nome_porta(p) for p in h.portas) or "nenhuma", extra))
+            ", ".join(nome_porta(p) for p in h.portas) or "nenhuma"))
         print("  %15s fabricante: %s | TTL: %s %s" % (
             "", fabricante(h.mac) or "-", h.ttl or "-", palpite_sistema(h.ttl)))
