@@ -123,7 +123,7 @@ class NetProbeApp:
         colunas = [("ip", "IP", 110), ("mac", "MAC", 140), ("fabricante", "Fabricante", 150),
                    ("nome", "Nome", 150), ("tipo", "Tipo provável", 160),
                    ("status", "Status", 65), ("metodo", "Descoberto por", 140),
-                   ("tempo", "Resposta", 70), ("ttl", "TTL (sistema)", 170),
+                   ("tempo", "Resposta", 70), ("ttl", "Último TTL (sistema provável)", 210),
                    ("portas", "Portas abertas", 230), ("visto", "Visto por último", 105),
                    ("obs", "Observações", 200)]
         self.colunas = colunas
@@ -402,10 +402,10 @@ class NetProbeApp:
             anterior = self.hosts[h.ip]
             h.portas = anterior.portas           # mantem as portas ja descobertas
             h.mac = h.mac or anterior.mac        # se o ARP falhou agora, mantem o MAC anterior
-            h.ttl = h.ttl or anterior.ttl        # rodada achada so por ARP nao tem TTL
             if anterior.mac and h.mac != anterior.mac:
                 self._mac_mudou(h.ip, anterior.mac, h.mac, estava_offline=(antes == "offline"))
             else:                                # mesmo aparelho: mantem o que ja foi descoberto
+                h.ttl = h.ttl or anterior.ttl
                 h.nome = h.nome or anterior.nome
                 h.servicos = h.servicos or anterior.servicos
                 h.modelo = h.modelo or anterior.modelo
@@ -481,7 +481,11 @@ class NetProbeApp:
             portas = "-"
         else:
             portas = "aguardando..."
-        ttl = "%d (%s)" % (h.ttl, scanner.palpite_sistema(h.ttl)) if h.ttl else "-"
+        ttl = "Sem medição"
+        if h.ttl is not None:
+            ttl = "%d (%s)" % (h.ttl, scanner.palpite_sistema(h.ttl))
+        elif h.metodo == "ARP":
+            ttl = "Sem TTL (só ARP)"
         valores = (ip, h.mac or "desconhecido", scanner.texto_fabricante(h.mac),
                    h.nome or "-", scanner.palpite_tipo(h, self.gateway), nome_status,
                    metodo, tempo, ttl, portas, self.visto.get(ip, "-"), self._observacoes(ip))
