@@ -74,7 +74,7 @@ python app.py
 | Timeout do ping (ms) | Quanto tempo esperar a resposta de cada ping (100 a 5000) | 500 |
 | Portas de / até | Intervalo de portas TCP testadas em cada aparelho online (1 a 65535) | 1 a 1024 |
 | Timeout da porta (ms) | Quanto tempo esperar em cada porta (50 a 5000) | 300 |
-| Monitorar em tempo real | Repete a varredura sozinho a cada N segundos (5 a 600) | desligado, 20 s |
+| Monitorar em tempo real | Repete a varredura sozinho a cada N segundos (5 a 600) | desligado, 5 s |
 
 **Botões**
 

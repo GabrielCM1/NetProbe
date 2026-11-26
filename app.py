@@ -70,7 +70,7 @@ class NetProbeApp:
         self.var_porta_fim = tk.StringVar(value="1024")
         self.var_timeout_porta = tk.StringVar(value="300")
         self.var_monitorar = tk.BooleanVar(value=False)
-        self.var_intervalo = tk.StringVar(value="20")
+        self.var_intervalo = tk.StringVar(value="5")
 
         def campo(texto, var, coluna, linha, largura=8, valores=None):
             ttk.Label(cfg, text=texto).grid(row=linha, column=coluna, sticky="w", padx=(0, 4), pady=3)
@@ -295,8 +295,9 @@ class NetProbeApp:
                     self.lbl_progresso.configure(text="Verificando IPs: %d de %d" % (self.feitos, self.total))
                     if msg[2]:
                         self._host_encontrado(msg[2])
+                    else:
+                        self._registrar_falta(msg[1])
                 elif tipo == "varredura_ok":
-                    self._marcar_offline(set(msg[1]))
                     self._redesenhar_tudo()       # atualiza as observacoes (ex.: MAC repetido)
                     self.log("Varredura concluída em %.1f s: %d dispositivo(s) online" % (msg[2], len(msg[1])))
                     self.lbl_progresso.configure(text="Verificando portas...")
@@ -376,22 +377,18 @@ class NetProbeApp:
             self.log("ALERTA: possível COLISÃO DE IP em %s: MAC %s -> %s. Dois aparelhos com o "
                      "mesmo IP, ou ARP spoofing." % (ip, mac_antigo, mac_novo))
 
-    def _marcar_offline(self, online_agora: set):
-        """Quem ja tinha aparecido e nao respondeu nesta rodada.
-        So vira OFFLINE depois de faltar em 2 rodadas seguidas: celulares em modo
-        economia as vezes deixam de responder uma vez, e a tela ficaria piscando."""
-        for ip in self.hosts:
-            if ip in online_agora or self.status.get(ip) == "offline":
-                continue
-            self.faltas[ip] = self.faltas.get(ip, 0) + 1
-            if self.faltas[ip] == 1:
-                self.log("%s não respondeu nesta rodada (será OFFLINE se faltar de novo)" % ip)
-            else:
-                self.status[ip] = "offline"
-                self.portas_feitas.discard(ip)    # quando voltar, verifica as portas de novo
-                self.log("%s ficou OFFLINE" % ip)
-                self._desenhar_linha(ip)
-        self._atualizar_resumo()
+    def _registrar_falta(self, ip: str):
+        """Conta uma falta assim que o ping e o ARP deste IP terminam sem resposta."""
+        if ip not in self.hosts or self.status.get(ip) == "offline":
+            return
+        self.faltas[ip] = self.faltas.get(ip, 0) + 1
+        if self.faltas[ip] == 1:
+            self.log("%s não respondeu nesta rodada (será OFFLINE se faltar de novo)" % ip)
+            return
+        self.status[ip] = "offline"
+        self.portas_feitas.discard(ip)
+        self.log("%s ficou OFFLINE" % ip)
+        self._desenhar_linha(ip)
 
     def _desenhar_linha(self, ip: str):
         h, st = self.hosts[ip], self.status[ip]
