@@ -13,6 +13,7 @@ e sem precisar de administrador/root.
 Pode ser testado sem a interface:  python scanner.py 192.168.15.0/24
 """
 import ctypes
+import functools
 import ipaddress
 import os
 import re
@@ -100,23 +101,23 @@ def em_paralelo(funcao: Callable, itens, threads: int, parar: Callable[[], bool]
     """Roda funcao(item) para todos os itens ao mesmo tempo e chama
     ao_terminar(item, resultado) a cada um que fica pronto.
 
-    O pedido de parar e conferido a cada 0,2 s (e nao so quando algum item termina):
-    na fase do ARP, centenas de IPs ficam varios segundos sem terminar.
-    Ao parar, nao espera os itens que ainda estao rodando. Devolve True se foi parado."""
+    Por que nao um simples 'for tarefa in as_completed(...)'? Porque assim o pedido de
+    parar so seria conferido quando algum item terminasse, e na fase do ARP centenas
+    de IPs ficam varios segundos sem terminar: o botao Parar demorava ~5 s.
+    Com wait(timeout=0.2), o laco "acorda" pelo menos a cada 0,2 s para conferir.
+
+    Ao parar, nao espera os itens que ainda estao rodando (eles terminam sozinhos
+    em segundo plano). Devolve True se foi parado antes de acabar."""
     pool = ThreadPoolExecutor(max_workers=threads)
-    pendentes = {pool.submit(funcao, item): item for item in itens}
-    parado = False
+    pendentes = {pool.submit(funcao, item): item for item in itens}   # tarefa -> item
     try:
-        while pendentes and not parado:
+        while pendentes and not parar():
             prontos, _ = wait(pendentes, timeout=0.2, return_when=FIRST_COMPLETED)
             for tarefa in prontos:
-                if parar():
-                    break
                 ao_terminar(pendentes.pop(tarefa), tarefa.result())
-            parado = parar()
     finally:
-        pool.shutdown(wait=not parado, cancel_futures=True)
-    return parado
+        pool.shutdown(wait=False, cancel_futures=True)   # cancela o que nem comecou
+    return bool(pendentes)
 
 
 def mac_aleatorio(mac: Optional[str]) -> bool:
@@ -149,23 +150,16 @@ def ips_locais() -> List[str]:
             ips.append(info[4][0])
     except OSError:
         pass
-    unicos = []
-    for ip in ips:
-        if ip not in unicos and not ip.startswith(("127.", "0.")):
-            unicos.append(ip)
-    return unicos
+    # dict.fromkeys tira os repetidos mantendo a ordem (o IP da rota padrao fica primeiro)
+    return [ip for ip in dict.fromkeys(ips) if not ip.startswith(("127.", "0."))]
 
 
 def redes_sugeridas() -> List[str]:
     """Transforma cada IP local numa rede /24, colocando as redes de casa
     (192.168.x.x, 10.x.x.x, 172.16-31.x.x) primeiro. Ex.: 192.168.15.6 -> 192.168.15.0/24"""
-    redes = []
-    for ip in ips_locais():
-        rede = str(ipaddress.ip_network(ip + "/24", strict=False))
-        if rede not in redes:
-            redes.append(rede)
-    redes.sort(key=lambda r: not ipaddress.ip_network(r).is_private)
-    return redes
+    redes = dict.fromkeys(str(ipaddress.ip_network(ip + "/24", strict=False)) for ip in ips_locais())
+    # sorted e estavel: as privadas (False) vem antes, sem mudar a ordem entre elas
+    return sorted(redes, key=lambda r: not ipaddress.ip_network(r).is_private)
 
 
 def ler_rede(texto: str) -> ipaddress.IPv4Network:
@@ -244,6 +238,12 @@ except AttributeError:  # nao e Windows
 
 
 def _sondar_arp_windows(ip: str, tentativas: int) -> Optional[str]:
+    # Assinatura em C:  DWORD SendARP(IPAddr DestIP, IPAddr SrcIP, PVOID pMacAddr, PULONG PhyAddrLen)
+    # O ctypes precisa receber cada parametro no formato da linguagem C:
+    #   - DestIP: o IP como um inteiro de 32 bits, na ordem de bytes da rede;
+    #   - SrcIP = 0: "escolha voce a placa de rede";
+    #   - pMacAddr: um vetor de 6 bytes onde o Windows escreve o MAC;
+    #   - PhyAddrLen: entra 6 (tamanho do vetor) e sai quantos bytes foram escritos.
     if _iphlpapi is None:
         return None
     destino = struct.unpack("=I", socket.inet_aton(ip))[0]   # IP no formato que o Windows espera
@@ -283,7 +283,11 @@ _vizinhos_cache: Tuple[float, Dict[str, Tuple[Optional[str], str]]] = (0.0, {})
 
 def vizinhos_linux(max_idade: float = 0.25) -> Dict[str, Tuple[Optional[str], str]]:
     """Tabela de vizinhos (cache ARP) do Linux. Como ate 256 threads consultam a tabela
-    ao mesmo tempo, ela e lida no maximo a cada 0,25 s e compartilhada entre todas."""
+    ao mesmo tempo, ela e lida no maximo a cada 0,25 s e compartilhada entre todas.
+
+    Sem isso, cada thread rodaria o comando 'ip neigh' 4 vezes por segundo:
+    ~1000 processos por segundo so para ler a mesma tabela. A trava (Lock) garante
+    que so uma thread rode o comando; as outras esperam e usam o mesmo resultado."""
     global _vizinhos_cache
     with _vizinhos_trava:
         lida_em, tabela = _vizinhos_cache
@@ -308,6 +312,10 @@ def _sondar_arp_linux(ip: str, tentativas: int) -> Optional[str]:
     # Cada tentativa: o kernel manda 3 ARP Requests (1 por segundo). Se o IP ja estava
     # na tabela como STALE (visto ha algum tempo), o kernel espera ~5 s antes de
     # reconfirmar, por isso o limite de 9 s.
+    # Estados da tabela de vizinhos que importam aqui:
+    #   INCOMPLETE -> ARP enviado, esperando resposta    REACHABLE -> respondeu agora ha pouco
+    #   STALE/DELAY/PROBE -> conhecido, sendo reconfirmado  FAILED  -> ninguem respondeu
+    #   (sem entrada) -> o kernel nem tentou: o IP nao esta na rede local
     for _ in range(tentativas):
         inicio = time.monotonic()
         _provocar_arp(ip)
@@ -387,6 +395,9 @@ def verificar_ip(ip: str, timeout_ms: int, meus_ips: List[str]) -> Optional[Host
     if resposta is not None:
         tempo, ttl = resposta
         # Ja sabemos que existe. O ping ja fez o ARP, entao o MAC esta no cache.
+        # A ordem muda por sistema so por custo: no Windows o SendARP ja consulta o cache
+        # e e uma chamada de funcao (barata), enquanto 'arp -a' abre um processo.
+        # No Linux e o contrario: a tabela de vizinhos ja esta lida (cache de 0,25 s).
         if WINDOWS:
             mac = sondar_arp(ip, tentativas=2) or mac_da_tabela_arp(ip)
         else:
@@ -468,27 +479,22 @@ def texto_tempo(tempo_ms: Optional[float]) -> str:
 #     TVs, Chromecast, impressoras), NetBIOS (Windows) ou DNS reverso (roteador).
 #   - TIPO PROVAVEL: um palpite juntando nome, portas abertas, fabricante e TTL.
 ARQUIVO_FABRICANTES = Path(__file__).resolve().parent / "fabricantes.txt"
-_fabricantes: Optional[Dict[str, str]] = None
-_fabricantes_trava = threading.Lock()
 
 
+@functools.lru_cache(maxsize=None)    # le o arquivo so na 1a vez; depois devolve o mesmo dicionario
 def carregar_fabricantes() -> Dict[str, str]:
-    """Le o fabricantes.txt uma unica vez: {'F4E84F': 'ZTE', ...}. Sem o arquivo, fica vazio."""
-    global _fabricantes
-    with _fabricantes_trava:
-        if _fabricantes is None:
-            tabela = {}
-            try:
-                with open(ARQUIVO_FABRICANTES, encoding="utf-8") as f:
-                    for linha in f:
-                        if not linha.startswith("#"):
-                            prefixo, _, nome = linha.rstrip("\n").partition("\t")
-                            if nome:
-                                tabela[prefixo] = nome
-            except OSError:
-                pass
-            _fabricantes = tabela
-        return _fabricantes
+    """Le o fabricantes.txt: {'F4E84F': 'ZTE', ...}. Sem o arquivo, fica vazio."""
+    tabela = {}
+    try:
+        with open(ARQUIVO_FABRICANTES, encoding="utf-8") as f:
+            for linha in f:
+                if not linha.startswith("#"):
+                    prefixo, _, nome = linha.rstrip("\n").partition("\t")
+                    if nome:
+                        tabela[prefixo] = nome
+    except OSError:
+        pass
+    return tabela
 
 
 def fabricante(mac: Optional[str]) -> Optional[str]:
@@ -498,16 +504,32 @@ def fabricante(mac: Optional[str]) -> Optional[str]:
         return None
     hexa = mac.replace("-", "").upper()
     tabela = carregar_fabricantes()
-    for tamanho in (9, 7, 6):        # blocos menores (36 e 28 bits) primeiro, depois o OUI de 24 bits
+    # O IEEE vende blocos de 3 tamanhos: 24 bits (6 digitos hex, o OUI comum), 28 bits (7)
+    # e 36 bits (9). Um mesmo prefixo de 6 digitos pode ter sido dividido entre varias
+    # empresas pequenas, entao o bloco mais especifico tem que ser procurado primeiro.
+    for tamanho in (9, 7, 6):
         nome = tabela.get(hexa[:tamanho])
         if nome:
             return nome
     return None
 
 
+def texto_fabricante(mac: Optional[str]) -> str:
+    """O que mostrar na coluna Fabricante: o nome, 'MAC aleatório (privado)' ou '-'."""
+    if mac_aleatorio(mac):
+        return "MAC aleatório (privado)"
+    return fabricante(mac) or "-"
+
+
 def _nome_dns(dados: bytes, pos: int) -> Tuple[str, int]:
     """Le um nome no formato DNS ('\\x07Android\\x05local\\x00', com compressao).
-    Devolve (nome, posicao logo depois dele)."""
+    Devolve (nome, posicao logo depois dele).
+
+    No pacote DNS, 'Android.local' vira: [7]Android[5]local[0], ou seja, cada pedaco
+    vem precedido do seu tamanho, e o 0 marca o fim. Para economizar espaco existe a
+    COMPRESSAO: um byte com os 2 bits de cima ligados (0xC0) e um ponteiro, que diz
+    "o resto do nome esta na posicao X do pacote". Por isso guardamos 'depois':
+    a leitura continua em X, mas o proximo campo do pacote comeca logo apos o ponteiro."""
     partes, depois = [], None
     for _ in range(128):                         # protege contra pacote malformado
         n = dados[pos]
@@ -553,8 +575,10 @@ def interpretar_mdns(dados: bytes) -> Optional[str]:
 
 def interpretar_netbios(dados: bytes) -> Optional[str]:
     """Tira o nome do computador da resposta NetBIOS 'Node Status'.
-    Cada nome ocupa 18 bytes: 15 do nome + 1 de sufixo + 2 de flags.
-    O nome do computador e o de sufixo 0x00 que nao e de grupo."""
+    Os primeiros 56 bytes sao fixos (cabecalho + nome perguntado + tipo/classe/TTL/tamanho);
+    o byte 56 diz quantos nomes vem a seguir. Cada nome ocupa 18 bytes:
+    15 do nome + 1 de sufixo + 2 de flags. O nome do computador e o de sufixo 0x00
+    que nao e de grupo (o de grupo, flag 0x8000, e o do grupo de trabalho, ex.: WORKGROUP)."""
     try:
         quantos = dados[56]
         for i in range(quantos):
@@ -568,6 +592,7 @@ def interpretar_netbios(dados: bytes) -> Optional[str]:
 
 
 def _perguntar_udp(ip: str, porta: int, pacote: bytes, timeout: float) -> Optional[bytes]:
+    """Manda 1 pacote UDP e espera a resposta DESSE ip (ignora pacotes de outros)."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(timeout)
@@ -586,7 +611,10 @@ def nome_mdns(ip: str, timeout: float = 1.0) -> Optional[str]:
 
 
 def nome_netbios(ip: str, timeout: float = 0.8) -> Optional[str]:
-    # Pergunta "Node Status" para o nome curinga '*' (codificado como CKAAAA...)
+    # Pergunta "Node Status" (tipo 0x21): "me diga todos os seus nomes".
+    # O nome perguntado e o curinga '*'. O NetBIOS codifica cada byte do nome em 2 letras
+    # (metade de cima e metade de baixo + 'A'): '*' = 0x2A -> 'C','K', e o resto do nome
+    # (15 bytes zero) vira 'AA' 15 vezes. Resultado: 'CK' + 30 'A', com tamanho 32 (0x20).
     pacote = (struct.pack(">HHHHHH", 0x4E50, 0, 1, 0, 0, 0) + b"\x20" + b"CK" + b"A" * 30
               + b"\x00" + struct.pack(">HH", 0x21, 1))
     dados = _perguntar_udp(ip, 137, pacote, timeout)
@@ -696,7 +724,11 @@ _PISTAS_FABRICANTE = [
 
 def palpite_tipo(h: Host, gateway: Optional[str] = None) -> str:
     """Palpite de QUE aparelho e, juntando as pistas. Devolve '' se nao der para saber.
-    E um palpite: um nome ou uma porta podem enganar."""
+    E um palpite: um nome ou uma porta podem enganar.
+
+    A ordem importa: a primeira pista que bater decide. O nome vem primeiro porque e
+    o proprio aparelho dizendo o que e; o fabricante vem depois das portas porque uma
+    Samsung pode ser celular ou TV, mas a porta 8009 aberta indica que tem Chromecast."""
     if h.este_pc:
         return "Este computador"
     if gateway and h.ip == gateway:
@@ -743,5 +775,4 @@ if __name__ == "__main__":
             h.ip, h.mac or "?", h.metodo, texto_tempo(h.tempo_ms),
             ", ".join(nome_porta(p) for p in h.portas) or "nenhuma"))
         print("  %15s fabricante: %s | nome: %s | tipo provável: %s" % (
-            "", h.fabricante or ("MAC aleatório" if mac_aleatorio(h.mac) else "?"),
-            h.nome or "-", palpite_tipo(h, gateway) or "?"))
+            "", texto_fabricante(h.mac), h.nome or "-", palpite_tipo(h, gateway) or "?"))

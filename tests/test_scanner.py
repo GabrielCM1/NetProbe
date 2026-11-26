@@ -227,6 +227,12 @@ class TestFabricante(unittest.TestCase):
         self.assertIsNone(scanner.fabricante("6A-25-C6-23-AF-B0"))
         self.assertIsNone(scanner.fabricante(None))
 
+    def test_texto_da_coluna(self):
+        self.assertEqual(scanner.texto_fabricante("F4-E8-4F-98-1B-94"), "ZTE")
+        self.assertEqual(scanner.texto_fabricante("6A-25-C6-23-AF-B0"), "MAC aleatório (privado)")
+        self.assertEqual(scanner.texto_fabricante("0C-00-00-00-00-01"), "-")
+        self.assertEqual(scanner.texto_fabricante(None), "-")
+
     def test_propriedade_do_host(self):
         self.assertEqual(scanner.Host("10.0.0.1", "F4-E8-4F-00-00-01", "PING", 1).fabricante, "ZTE")
 

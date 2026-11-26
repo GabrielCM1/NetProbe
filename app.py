@@ -254,7 +254,7 @@ class NetProbeApp:
         """Roda FORA da tela (em outra thread), para a janela nao travar.
         Nao mexe na tela diretamente: manda mensagens pela fila."""
         try:
-            total = p["rede"].num_addresses - 2 if p["rede"].prefixlen < 31 else p["rede"].num_addresses
+            total = sum(1 for _ in p["rede"].hosts())   # IPs testaveis (sem rede e broadcast)
             self.fila.put(("inicio", total, str(p["rede"])))
             t0 = time.time()
             achados = scanner.varrer_rede(
@@ -301,7 +301,19 @@ class NetProbeApp:
 
     # ------------------------------------------------------------------ fila -> tela
     def _processar_fila(self):
-        """Roda a cada 100 ms na thread da tela e aplica as mensagens da varredura."""
+        """Roda a cada 100 ms na thread da tela e aplica as mensagens da varredura.
+
+        Por que uma fila? O Tkinter so aceita ser mexido pela thread que criou a janela.
+        A thread de varredura entao so ENVIA mensagens, e esta funcao as aplica na tela.
+        Mensagens (sempre uma tupla, o 1o item diz o tipo):
+          ("inicio", total, rede)        comecou uma rodada
+          ("ip", ip, host ou None)       terminou um IP (None = vazio)
+          ("varredura_ok", ips, segundos) terminou o ping+ARP de todos
+          ("portas_inicio", ip)          comecou o teste de portas deste IP
+          ("portas", ip, [portas])       terminou o teste de portas
+          ("nome", ip, nome)             o aparelho disse o proprio nome
+          ("fim", parado)                acabou a rodada (parado = clicaram em Parar)
+          ("erro", texto)                deu erro inesperado na thread"""
         try:
             while True:
                 msg = self.fila.get_nowait()
@@ -366,6 +378,8 @@ class NetProbeApp:
 
     # ------------------------------------------------------------------ tabela
     def _host_encontrado(self, h: scanner.Host):
+        # A cada rodada chega um Host NOVO para o mesmo IP. Aqui juntamos com o que ja se
+        # sabia dele: o que a rodada atual nao trouxe (portas, MAC, TTL, nome) vem da anterior.
         novo = h.ip not in self.hosts
         antes = self.status.get(h.ip)
         if not novo:
@@ -438,13 +452,8 @@ class NetProbeApp:
             portas = "-"
         else:
             portas = "aguardando..."
-        if h.fabricante:
-            fabricante = h.fabricante
-        elif scanner.mac_aleatorio(h.mac):
-            fabricante = "MAC aleatório (privado)"
-        else:
-            fabricante = "-"
-        valores = (ip, h.nome or "-", scanner.palpite_tipo(h, self.gateway) or "-", fabricante,
+        valores = (ip, h.nome or "-", scanner.palpite_tipo(h, self.gateway) or "-",
+                   scanner.texto_fabricante(h.mac),
                    h.mac or "desconhecido", nome_status, metodo, tempo, portas,
                    self.visto.get(ip, "-"), self._observacoes(ip))
         tag = "conflito" if ip in self.conflitos and st != "offline" else st
